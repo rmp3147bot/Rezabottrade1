@@ -1,1 +1,23 @@
+# فایل: .github/workflows/deploy.yml در مخزن مرکزی
+name: گردش‌کار اصلی استقرار
 
+on:
+  workflow_call:  # 👈 این خط آن را به یک گردش‌کار قابل استفاده مجدد تبدیل می‌کند
+    inputs:
+      environment:
+        description: 'محیط مورد نظر (مثلاً staging یا production)'
+        required: true
+        type: string
+    secrets:
+      DEPLOY_TOKEN:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Run deployment script
+        run: echo "Deploying to ${{ inputs.environment }}"
+      # مراحل واقعی استقرار شما...
