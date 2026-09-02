@@ -1,21 +1,11 @@
-# ============================================================================
-# REZA BOT V50.7 + EXECUTION PLATFORM V1.0 — ۲۴ ساعته با لاگ لایو
-# ============================================================================
-
 name: REZA BOT & PLATFORM 24H LIVE
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   run-reza:
-    name: REZA 24H LIVE TEST
     runs-on: ubuntu-latest
-
-    # ۲۴ ساعت + زمان اضافی
     timeout-minutes: 1440
 
     env:
@@ -23,421 +13,149 @@ jobs:
       XT_API_SECRET: ${{ secrets.XT_API_SECRET }}
       XT_MARGIN_USDT: "4.0"
       XT_LEVERAGE: "8"
-      REZA_PLATFORM_URL: "http://127.0.0.1:8787"
+      REZA_PLATFORM_URL: "http://127.0.0.1:8789"
       REZA_PLATFORM_ENABLED: "1"
-      REZA_PLATFORM_TIMEOUT: "3"
-      REZA_PLATFORM_RETRY_SECONDS: "2"
-      REZA_PLATFORM_HEALTH_INTERVAL: "5"
       PYTHONUNBUFFERED: "1"
 
     steps:
+      - uses: actions/checkout@v4
 
-      # ================================================================
-      # 1. دریافت کد از مخزن
-      # ================================================================
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # ================================================================
-      # 2. نصب Python
-      # ================================================================
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ================================================================
-      # 3. نصب وابستگی‌ها
-      # ================================================================
       - name: Install dependencies
-        shell: bash
-        run: |
-          set -e
-          python -m pip install --upgrade pip
-          pip install requests
+        run: pip install requests
 
-      # ================================================================
-      # 4. تبدیل فایل‌های .txt به .py
-      # ================================================================
-      - name: Prepare Bot and Platform
-        shell: bash
+      - name: Prepare files
         run: |
-          set -e
           cp reza_bot_v50_7.txt reza_bot_v50_7.py
           cp reza_execution_platform_v1.txt reza_execution_platform_v1.py
-
-          rm -rf runtime_reports
-          rm -rf reza_execution_platform_v1_data
-          rm -rf reza_bot_v50_7_data
-
-          mkdir -p runtime_reports
-          mkdir -p reza_execution_platform_v1_data
-          mkdir -p reza_bot_v50_7_data
-
-          python -m py_compile reza_bot_v50_7.py
-          python -m py_compile reza_execution_platform_v1.py
-
-          echo "✅ Python syntax validation: OK"
+          mkdir -p runtime_reports reza_bot_v50_7_data reza_execution_platform_v1_data
 
       # ================================================================
-      # 5. تنظیم پیکربندی پلتفرم
+      # ✅ کانفیگ پلتفرم
       # ================================================================
-      - name: Configure Execution Platform
-        shell: bash
+      - name: Create platform config
         run: |
-          set -e
-          python - <<'PY'
-          import json
-          import os
+          python -c "
+          import json, os
           from pathlib import Path
-
-          data_dir = Path("reza_execution_platform_v1_data")
-          data_dir.mkdir(exist_ok=True)
-
+          
+          Path('reza_execution_platform_v1_data').mkdir(exist_ok=True)
+          
+          api_key = os.environ.get('XT_API_KEY', '')
+          api_secret = os.environ.get('XT_API_SECRET', '')
+          
+          if not api_key or not api_secret:
+              print('❌ API credentials not found!')
+              exit(1)
+          
+          margin = float(os.environ.get('XT_MARGIN_USDT', '4.0'))
+          leverage = int(os.environ.get('XT_LEVERAGE', '8'))
+          
           config = {
-              "exchange": "XT",
-              "market": "USDT-M FUTURES",
-              "symbol": "btc_usdt",
-              "api_key": os.environ["XT_API_KEY"],
-              "api_secret": os.environ["XT_API_SECRET"],
-              "margin_usdt": float(os.environ["XT_MARGIN_USDT"]),
-              "leverage": int(os.environ["XT_LEVERAGE"]),
-              "configured": True
+              'exchange': 'XT',
+              'market': 'USDT-M FUTURES',
+              'symbol': 'btc_usdt',
+              'api_key': api_key,
+              'api_secret': api_secret,
+              'margin_usdt': margin,
+              'leverage': leverage,
+              'configured': True
+          }
+          
+          with open('reza_execution_platform_v1_data/platform_config.json', 'w') as f:
+              json.dump(config, f, indent=2)
+          
+          print('✅ Platform config created')
+          print(f'   API KEY: {api_key[:8]}...')
+          print(f'   Margin: {margin} USDT')
+          print(f'   Leverage: {leverage}x')
+          "
+
+      # ================================================================
+      # ✅ تغییر پورت پلتفرم به 8789
+      # ================================================================
+      - name: Change platform port to 8789
+        run: |
+          sed -i 's/PLATFORM_PORT = 8787/PLATFORM_PORT = 8789/g' reza_execution_platform_v1.py
+          sed -i 's/PLATFORM_PORT = 8788/PLATFORM_PORT = 8789/g' reza_execution_platform_v1.py
+          echo "✅ Platform port changed to 8789"
+
+      # ================================================================
+      # ✅ مرحله 1: ربات (Webhook Server در 8765)
+      # ================================================================
+      - name: Start Bot
+        run: |
+          echo "🚀 Starting Bot..."
+          nohup python -u reza_bot_v50_7.py > runtime_reports/bot.log 2>&1 &
+          echo $! > runtime_reports/bot.pid
+          
+          sleep 5
+          for i in $(seq 1 10); do
+            if curl -fsS http://127.0.0.1:8765/health > /dev/null 2>&1; then
+              echo "✅ Webhook Server ready"
+              break
+            fi
+            sleep 1
+          done
+
+      # ================================================================
+      # ✅ مرحله 2: پلتفرم روی پورت 8789
+      # ================================================================
+      - name: Start Platform
+        run: |
+          echo "🚀 Starting Platform on port 8789..."
+          nohup python -u reza_execution_platform_v1.py > runtime_reports/platform.log 2>&1 &
+          echo $! > runtime_reports/platform.pid
+          
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8789/health > /dev/null 2>&1; then
+              echo "✅ Platform ready (attempt $i)"
+              break
+            fi
+            if [ $((i % 5)) -eq 0 ]; then
+              echo "⏳ Waiting for platform on 8789... ($i/60)"
+            fi
+            sleep 1
+          done
+          
+          echo ""
+          echo "===== PLATFORM LOG ====="
+          cat runtime_reports/platform.log
+          echo "========================"
+          
+          curl -fsS http://127.0.0.1:8789/health || {
+            echo "❌ Platform failed to start on port 8789"
+            exit 1
           }
 
-          path = data_dir / "platform_config.json"
-          with open(path, "w", encoding="utf-8") as f:
-              json.dump(config, f, indent=2)
-
-          print("✅ Platform configuration created.")
-          print(f"   Margin: {config['margin_usdt']} USDT")
-          print(f"   Leverage: {config['leverage']}x")
-          PY
-
       # ================================================================
-      # 6. راه‌اندازی پلتفرم
+      # ✅ مرحله 3: لاگ لایو
       # ================================================================
-      - name: Start Execution Platform
-        shell: bash
+      - name: Live Logs
         run: |
-          set +e
-
           echo "=============================================="
-          echo "🚀 STARTING REZA EXECUTION PLATFORM V1.0"
+          echo "🔥 REZA 24H LIVE"
           echo "=============================================="
-
-          : > runtime_reports/platform.log
-
-          nohup python -u reza_execution_platform_v1.py \
-            > runtime_reports/platform.log 2>&1 &
-
-          PLATFORM_PID=$!
-          echo "$PLATFORM_PID" > runtime_reports/platform.pid
-          echo "PLATFORM PID: $PLATFORM_PID"
-
-          # منتظر آماده شدن پلتفرم
-          PLATFORM_READY="0"
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8787/health > /dev/null 2>&1; then
-              echo "✅ PLATFORM HEALTH: ONLINE"
-              PLATFORM_READY="1"
-              break
-            fi
-            if ! kill -0 "$PLATFORM_PID" 2>/dev/null; then
-              echo "❌ Platform process stopped during startup."
-              tail -n 50 runtime_reports/platform.log || true
-              break
-            fi
-            sleep 1
-          done
-
-          if [ "$PLATFORM_READY" != "1" ]; then
-            echo "❌ Platform did not become ready."
-            tail -n 100 runtime_reports/platform.log || true
-            exit 1
-          fi
-
-          echo "✅ PLATFORM STARTUP COMPLETE"
-
-      # ================================================================
-      # 7. راه‌اندازی ربات
-      # ================================================================
-      - name: Start REZA BOT V50.7
-        shell: bash
-        run: |
-          set +e
-
+          echo "BOT      : http://127.0.0.1:8765 (Webhook)"
+          echo "PLATFORM : http://127.0.0.1:8789"
           echo "=============================================="
-          echo "🚀 STARTING REZA BOT V50.7"
-          echo "=============================================="
+          
+          tail -n 0 -F runtime_reports/bot.log | while read line; do echo "[BOT] $line"; done &
+          tail -n 0 -F runtime_reports/platform.log | while read line; do echo "[PLATFORM] $line"; done &
+          
+          while true; do sleep 10; done
 
-          : > runtime_reports/bot.log
-
-          nohup python -u reza_bot_v50_7.py \
-            > runtime_reports/bot.log 2>&1 &
-
-          BOT_PID=$!
-          echo "$BOT_PID" > runtime_reports/bot.pid
-          echo "BOT PID: $BOT_PID"
-
-          sleep 5
-
-          if kill -0 "$BOT_PID" 2>/dev/null; then
-            echo "✅ BOT STATUS: RUNNING"
-          else
-            echo "⚠️ BOT stopped during startup. Watchdog will restart."
-          fi
-
-      # ================================================================
-      # 8. اجرا با نمایش لاگ لایو و Watchdog
-      # ================================================================
-      - name: Runtime Monitor — Live Logs + Watchdog
-        shell: bash
-        run: |
-          set +e
-
-          echo "=============================================="
-          echo "🔥 REZA 24H LIVE TEST RUNNING"
-          echo "=============================================="
-          echo ""
-          echo "BOT      : V50.7"
-          echo "PLATFORM : V1.0"
-          echo "EXECUTE  : XT BTCUSDT USDT-M"
-          echo ""
-          echo "MARGIN   : ${XT_MARGIN_USDT} USDT"
-          echo "LEVERAGE : ${XT_LEVERAGE}x"
-          echo ""
-          echo "LIVE ORDER EXECUTION: ENABLED"
-          echo "HOURLY RESTART      : DISABLED"
-          echo "WATCHDOG            : ENABLED"
-          echo ""
-          echo "=============================================="
-          echo "📡 LIVE LOGS:"
-          echo "=============================================="
-          echo ""
-
-          # ============================================================
-          # نمایش لاگ لایو (BOT)
-          # ============================================================
-          tail -n 0 -F runtime_reports/bot.log 2>/dev/null \
-            | while IFS= read -r line; do
-                echo "[BOT] $line"
-              done &
-
-          BOT_LOG_TAIL_PID=$!
-
-          # ============================================================
-          # نمایش لاگ لایو (PLATFORM)
-          # ============================================================
-          tail -n 0 -F runtime_reports/platform.log 2>/dev/null \
-            | while IFS= read -r line; do
-                echo "[PLATFORM] $line"
-              done &
-
-          PLATFORM_LOG_TAIL_PID=$!
-
-          echo "BOT LOG TAIL PID      : $BOT_LOG_TAIL_PID"
-          echo "PLATFORM LOG TAIL PID : $PLATFORM_LOG_TAIL_PID"
-          echo "=============================================="
-
-          # ============================================================
-          # حلقه اصلی Watchdog
-          # ============================================================
-          while true; do
-
-            # ------------------------------------------------------------
-            # WATCHDOG: بررسی و بازیابی BOT
-            # ------------------------------------------------------------
-            if [ -f runtime_reports/bot.pid ]; then
-              BOT_PID="$(cat runtime_reports/bot.pid 2>/dev/null)"
-              if [ -z "$BOT_PID" ] || ! kill -0 "$BOT_PID" 2>/dev/null; then
-                echo ""
-                echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-                echo "⚠️ BOT WATCHDOG: BOT IS NOT RUNNING"
-                echo "UTC TIME: $(date -u '+%Y-%m-%d %H:%M:%S')"
-                echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-
-                tail -n 30 runtime_reports/bot.log || true
-
-                echo ""
-                echo "🔄 WATCHDOG: RESTARTING BOT..."
-
-                nohup python -u reza_bot_v50_7.py \
-                  > runtime_reports/bot.log 2>&1 &
-
-                BOT_NEW_PID=$!
-                echo "$BOT_NEW_PID" > runtime_reports/bot.pid
-                echo "✅ WATCHDOG BOT NEW PID: $BOT_NEW_PID"
-
-                sleep 5
-                if kill -0 "$BOT_NEW_PID" 2>/dev/null; then
-                  echo "✅ WATCHDOG: BOT RECOVERED"
-                else
-                  echo "❌ WATCHDOG: BOT DID NOT START"
-                fi
-              fi
-            fi
-
-            # ------------------------------------------------------------
-            # WATCHDOG: بررسی و بازیابی PLATFORM
-            # ------------------------------------------------------------
-            if ! curl -fsS http://127.0.0.1:8787/health > /dev/null 2>&1; then
-              echo ""
-              echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-              echo "⚠️ PLATFORM WATCHDOG: PLATFORM NOT HEALTHY"
-              echo "UTC TIME: $(date -u '+%Y-%m-%d %H:%M:%S')"
-              echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-
-              if [ -f runtime_reports/platform.pid ]; then
-                PLATFORM_PID="$(cat runtime_reports/platform.pid 2>/dev/null)"
-                if [ -n "$PLATFORM_PID" ]; then
-                  kill "$PLATFORM_PID" 2>/dev/null || true
-                  sleep 2
-                  kill -9 "$PLATFORM_PID" 2>/dev/null || true
-                fi
-              fi
-
-              rm -f runtime_reports/platform.pid
-
-              echo "🔄 WATCHDOG: RESTARTING PLATFORM..."
-
-              nohup python -u reza_execution_platform_v1.py \
-                > runtime_reports/platform.log 2>&1 &
-
-              PLATFORM_NEW_PID=$!
-              echo "$PLATFORM_NEW_PID" > runtime_reports/platform.pid
-              echo "✅ WATCHDOG PLATFORM NEW PID: $PLATFORM_NEW_PID"
-
-              sleep 5
-              if curl -fsS http://127.0.0.1:8787/health > /dev/null 2>&1; then
-                echo "✅ WATCHDOG: PLATFORM RECOVERED"
-              else
-                echo "❌ WATCHDOG: PLATFORM STILL OFFLINE"
-              fi
-            fi
-
-            sleep 10
-
-          done
-
-      # ================================================================
-      # 9. گزارش نهایی
-      # ================================================================
-      - name: Final report
-        if: always()
-        shell: bash
-        run: |
-          set +e
-
-          mkdir -p runtime_reports/final
-
-          echo "==============================================" \
-            | tee runtime_reports/final/FINAL_REPORT.txt
-
-          echo "REZA 24H TEST FINAL REPORT" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "==============================================" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "TIME: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "CONFIGURATION" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "MARGIN: ${XT_MARGIN_USDT} USDT" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "LEVERAGE: ${XT_LEVERAGE}x" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "PLATFORM HEALTH" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          curl -fsS http://127.0.0.1:8787/health \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt \
-            || echo "Platform unreachable at end."
-
-          echo "" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "SIGNALS" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          if [ -f reza_bot_v50_7_data/signals.csv ]; then
-            tail -n 20 reza_bot_v50_7_data/signals.csv \
-              | tee -a runtime_reports/final/FINAL_REPORT.txt
-          else
-            echo "No signals.csv found." \
-              | tee -a runtime_reports/final/FINAL_REPORT.txt
-          fi
-
-          echo "" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "EXECUTION LOG" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          if [ -f reza_execution_platform_v1_data/execution_log.jsonl ]; then
-            tail -n 30 reza_execution_platform_v1_data/execution_log.jsonl \
-              | tee -a runtime_reports/final/FINAL_REPORT.txt
-          else
-            echo "No execution log found." \
-              | tee -a runtime_reports/final/FINAL_REPORT.txt
-          fi
-
-          echo "" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "==============================================" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-          echo "✅ FINAL REPORT READY" \
-            | tee -a runtime_reports/final/FINAL_REPORT.txt
-
-      # ================================================================
-      # 10. توقف فرآیندها
-      # ================================================================
-      - name: Stop Bot and Platform
-        if: always()
-        shell: bash
-        run: |
-          set +e
-
-          if [ -f runtime_reports/bot.pid ]; then
-            BOT_PID="$(cat runtime_reports/bot.pid 2>/dev/null)"
-            kill "$BOT_PID" 2>/dev/null || true
-            sleep 1
-            kill -9 "$BOT_PID" 2>/dev/null || true
-          fi
-
-          if [ -f runtime_reports/platform.pid ]; then
-            PLATFORM_PID="$(cat runtime_reports/platform.pid 2>/dev/null)"
-            kill "$PLATFORM_PID" 2>/dev/null || true
-            sleep 1
-            kill -9 "$PLATFORM_PID" 2>/dev/null || true
-          fi
-
-          echo "✅ Bot and Platform stopped."
-
-      # ================================================================
-      # 11. آپلود گزارش
-      # ================================================================
-      - name: Upload complete 24H report
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reza-24h-test-report
+          name: logs
           path: |
             runtime_reports/
             reza_bot_v50_7_data/
             reza_execution_platform_v1_data/
-          if-no-files-found: warn
           retention-days: 30
