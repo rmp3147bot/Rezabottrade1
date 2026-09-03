@@ -1,0 +1,2868 @@
+# ============================================================================
+# REZA BOT V50.7 - HYBRID OPTIMIZED (PORT 8789) - DUAL MODE
+# ============================================================================
+#
+# REFERENCE MARKET:
+# - Historical candles (startup): OKX (12 closed candles)
+# - Live candles: Built from XT real-time prices
+# - Real-time prices: XT ticker
+#
+# EXECUTION:
+# XT BTCUSDT USDT-M (via REZA EXECUTION PLATFORM)
+#
+# SIGNAL EXPIRY:
+# - Signals expire after 5 minutes if not executed
+#
+# STRATEGY LOGIC (DUAL MODE):
+#
+# حالت 1: REVERSE (ساعت‌های 00-06 و 20-23 UTC)
+#   - Entry = Close کندل شکست
+#   - Direction = OPPOSITE of breakout candle
+#   - R = 2 × (High - Low) of breakout candle, capped at 250
+#   - Stop = Entry ± R
+#   - TP = Entry ± (R × 1.5)
+#
+# حالت 2: TREND (ساعت‌های 06-20 UTC)
+#   - Entry = Close کندل شکست
+#   - Direction = SAME as breakout candle
+#   - R = 2 × (High - Low) of breakout candle, capped at 250
+#   - Stop = Entry ± R
+#   - TP = Entry ± (R × 1.5)
+#
+# ============================================================================
+
+import os
+import csv
+import json
+import time
+import logging
+import threading
+import hmac
+import hashlib
+import math
+import traceback
+
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal, ROUND_DOWN
+
+import requests
+
+
+# ============================================================================
+# VERSION
+# ============================================================================
+
+VERSION = "V50.7-HYBRID-DUAL-MODE"
+
+
+# ============================================================================
+# SIGNAL EXPIRY CONFIGURATION
+# ============================================================================
+
+SIGNAL_EXPIRY_SECONDS = 300
+
+
+# ============================================================================
+# XT REFERENCE MARKET (LIVE DATA)
+# ============================================================================
+
+XT_BASE_URL = os.getenv(
+    "XT_BASE_URL",
+    "https://fapi.xt.com"
+).rstrip("/")
+
+XT_SYMBOL = "btc_usdt"
+DISPLAY_SYMBOL = "BTCUSDT"
+
+BAR = "5m"
+
+SESSION_CANDLES = 12
+MAX_PRIMARY_CANDLES = 500
+POLL_SECONDS = 1.0
+
+REQUEST_TIMEOUT = 10
+MAX_RETRIES = 4
+
+
+# ============================================================================
+# OKX REFERENCE MARKET (HISTORICAL DATA - STARTUP ONLY)
+# ============================================================================
+
+OKX_BASE_URL = os.getenv(
+    "OKX_BASE_URL",
+    "https://www.okx.com"
+).rstrip("/")
+
+OKX_SYMBOL = "BTC-USDT-SWAP"
+
+
+# ============================================================================
+# APPROVED STRATEGY / EXECUTION CONSTANTS
+# ============================================================================
+
+TP_R_MULTIPLE = 1.5
+BREAKEVEN_R = 1.0
+MAX_R = 250
+
+
+# ============================================================================
+# DUAL MODE CONFIGURATION
+# ============================================================================
+
+# حالت REVERSE (برعکس کندل شکست) - Fake Breakout
+REVERSE_HOURS = [
+    (0, 6),     # ۰۰:۰۰ تا ۰۶:۰۰ UTC
+    (20, 23)    # ۲۰:۰۰ تا ۲۳:۰۰ UTC
+]
+
+# حالت TREND (همراه کندل شکست) - Trend Following
+TREND_HOURS = [
+    (6, 20)     # ۰۶:۰۰ تا ۲۰:۰۰ UTC
+]
+
+
+# ============================================================================
+# REZA EXECUTION PLATFORM CONNECTION (PORT 8789)
+# ============================================================================
+
+PLATFORM_BASE_URL = os.getenv(
+    "REZA_PLATFORM_URL",
+    "http://127.0.0.1:8789"
+).rstrip("/")
+
+PLATFORM_HEALTH_PATH = "/health"
+PLATFORM_SIGNAL_PATH = "/signal"
+
+PLATFORM_TIMEOUT = float(os.getenv("REZA_PLATFORM_TIMEOUT", "3"))
+PLATFORM_RETRY_SECONDS = float(os.getenv("REZA_PLATFORM_RETRY_SECONDS", "1"))
+PLATFORM_HEALTH_INTERVAL = float(os.getenv("REZA_PLATFORM_HEALTH_INTERVAL", "5"))
+
+PLATFORM_ENABLED = (
+    os.getenv("REZA_PLATFORM_ENABLED", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
+
+# ============================================================================
+# WEBHOOK CONFIGURATION
+# ============================================================================
+
+WEBHOOK_ENABLED = (
+    os.getenv("REZA_WEBHOOK_ENABLED", "0").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+WEBHOOK_URL = os.getenv("REZA_WEBHOOK_URL", "").strip()
+WEBHOOK_SECRET = os.getenv("REZA_WEBHOOK_SECRET", "").strip()
+WEBHOOK_TIMEOUT = float(os.getenv("REZA_WEBHOOK_TIMEOUT", "5"))
+
+
+# ============================================================================
+# DATA DIRECTORY
+# ============================================================================
+
+DATA_DIR = "reza_bot_v50_7_data"
+
+PRICE_FILE = os.path.join(DATA_DIR, "live_prices.csv")
+CANDLE_FILE = os.path.join(DATA_DIR, "closed_5m_candles.csv")
+SIGNAL_FILE = os.path.join(DATA_DIR, "signals.csv")
+SIGNAL_JSONL_FILE = os.path.join(DATA_DIR, "signals.jsonl")
+SIGNAL_STATE_FILE = os.path.join(DATA_DIR, "signal_state.json")
+SESSION_FILE = os.path.join(DATA_DIR, "sessions.csv")
+SESSION_STATE_FILE = os.path.join(DATA_DIR, "session_state.json")
+PLATFORM_QUEUE_FILE = os.path.join(DATA_DIR, "pending_platform_signals.jsonl")
+STRUCTURE_DEBUG_FILE = os.path.join(DATA_DIR, "structure_debug.jsonl")
+
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+log = logging.getLogger("REZA-BOT-V50.7-DUAL-MODE")
+
+
+# ============================================================================
+# HTTP SESSIONS
+# ============================================================================
+
+http_okx = requests.Session()
+http_okx.headers.update({
+    "User-Agent": "REZA-BOT-V50.7-DUAL-MODE",
+    "Accept": "application/json"
+})
+
+http_xt = requests.Session()
+http_xt.headers.update({
+    "User-Agent": "REZA-BOT-V50.7-DUAL-MODE",
+    "Accept": "application/json"
+})
+
+platform_http = requests.Session()
+platform_http.headers.update({
+    "User-Agent": "REZA-BOT-V50.7-PLATFORM-CLIENT",
+    "Accept": "application/json",
+    "Content-Type": "application/json"
+})
+
+
+# ============================================================================
+# GLOBAL STATE
+# ============================================================================
+
+primary_candles = []
+current_candle = None
+last_bucket = None
+last_price = None
+
+market_state = {
+    "last": None,
+    "mark": None,
+    "index": None,
+    "funding": None,
+    "ts": None
+}
+
+
+# ============================================================================
+# SESSION STATE
+# ============================================================================
+
+session_state = None
+last_session_start = None
+startup_waiting_for_session = True
+
+
+# ============================================================================
+# LAST SIGNAL
+# ============================================================================
+
+last_signal = None
+signal_sequence = 0
+
+
+# ============================================================================
+# RUN STATE
+# ============================================================================
+
+running = True
+
+
+# ============================================================================
+# PLATFORM STATE
+# ============================================================================
+
+platform_state = {
+    "enabled": PLATFORM_ENABLED,
+    "online": False,
+    "last_check": None,
+    "last_success": None,
+    "last_error": None,
+    "last_ack_signal": None,
+    "pending_count": 0
+}
+
+platform_lock = threading.Lock()
+platform_delivery_lock = threading.Lock()
+
+
+# ============================================================================
+# TIME UTILITIES
+# ============================================================================
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def format_utc(dt):
+    if dt is None:
+        return ""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def parse_utc_datetime(value):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith(" UTC"):
+            text = text[:-4]
+
+        try:
+            return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            pass
+
+    return None
+
+
+def restore_signal_datetime_fields(signal):
+    if not isinstance(signal, dict):
+        return signal
+
+    source_candle = signal.get("source_candle")
+    if isinstance(source_candle, str):
+        parsed = parse_utc_datetime(source_candle)
+        if parsed is not None:
+            signal["source_candle"] = parsed
+
+    signal_time = signal.get("time")
+    if isinstance(signal_time, str):
+        parsed = parse_utc_datetime(signal_time)
+        if parsed is not None:
+            signal["time"] = parsed
+
+    return signal
+
+
+def parse_xt_timestamp(value):
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000.0, timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def parse_okx_timestamp(value):
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value) / 1000.0, timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+# ============================================================================
+# STRATEGY MODE DETECTION
+# ============================================================================
+
+def get_strategy_mode():
+    """
+    تشخیص حالت معاملاتی بر اساس ساعت فعلی UTC
+    Returns: "REVERSE" or "TREND"
+    """
+    now = utc_now()
+    hour = now.hour
+    
+    # بررسی ساعت‌های REVERSE
+    for start, end in REVERSE_HOURS:
+        if start <= hour < end:
+            return "REVERSE"
+    
+    # بررسی ساعت‌های TREND
+    for start, end in TREND_HOURS:
+        if start <= hour < end:
+            return "TREND"
+    
+    # حالت پیش‌فرض (ایمن)
+    return "REVERSE"
+
+
+# ============================================================================
+# SIGNAL EXPIRY HELPERS
+# ============================================================================
+
+def is_signal_expired(signal):
+    signal_time = signal.get("time")
+    if signal_time is None:
+        return True
+    
+    if isinstance(signal_time, str):
+        signal_time = parse_utc_datetime(signal_time)
+    
+    if signal_time is None:
+        return True
+    
+    age = (utc_now() - signal_time).total_seconds()
+    return age > SIGNAL_EXPIRY_SECONDS
+
+
+# ============================================================================
+# SESSION HH:00 UTC
+# ============================================================================
+
+def session_start_for(dt):
+    return dt.replace(minute=0, second=0, microsecond=0)
+
+
+def next_session_start_after(dt):
+    current = session_start_for(dt)
+    if current > dt:
+        return current
+    return current + timedelta(hours=1)
+
+
+def session_end_for(start):
+    return start + timedelta(hours=1)
+
+
+# ============================================================================
+# FILE INITIALIZATION
+# ============================================================================
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def ensure_csv_files():
+    ensure_data_dir()
+
+    specs = [
+        (PRICE_FILE, ["time", "symbol", "last", "mark", "index", "funding"]),
+        (CANDLE_FILE, ["time", "open", "high", "low", "close", "samples", "source", "confirmed"]),
+        (SIGNAL_FILE, ["signal_id", "time", "source_candle", "symbol", "reference_market", "structure", "structure_direction", "hyper_high", "hyper_low", "direction", "reference_entry", "initial_stop", "initial_risk", "initial_tp", "tp_r_multiple", "entry_type", "candle_type", "break_type", "candle_range", "strategy_mode", "execution", "status", "platform_status"]),
+        (SESSION_FILE, ["session_start", "session_end", "structure", "structure_direction", "hyper_high", "hyper_low", "analysis_candles", "structure_score"])
+    ]
+
+    for path, header in specs:
+        if not os.path.exists(path):
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(header)
+
+
+def ensure_platform_queue_file():
+    ensure_data_dir()
+    if not os.path.exists(PLATFORM_QUEUE_FILE):
+        open(PLATFORM_QUEUE_FILE, "a", encoding="utf-8").close()
+
+
+# ============================================================================
+# JSON STATE HELPERS
+# ============================================================================
+
+def atomic_write_json(path, data):
+    ensure_data_dir()
+    temp = path + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(temp, path)
+    except Exception as exc:
+        log.error("Could not write JSON state %s: %s", path, exc)
+        try:
+            if os.path.exists(temp):
+                os.remove(temp)
+        except Exception:
+            pass
+
+
+def read_json_file(path, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        log.warning("Could not read JSON state %s: %s", path, exc)
+        return default
+
+
+# ============================================================================
+# SIGNAL CURRENT STATE
+# ============================================================================
+
+def load_signal_states():
+    data = read_json_file(SIGNAL_STATE_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_signal_state(signal, status=None, platform_status=None):
+    states = load_signal_states()
+    signal = restore_signal_datetime_fields(signal)
+    signal_id = str(signal.get("signal_id"))
+
+    if status is not None:
+        signal["status"] = status
+    if platform_status is not None:
+        signal["platform_status"] = platform_status
+
+    states[signal_id] = {
+        "signal_id": signal_id,
+        "status": signal.get("status"),
+        "platform_status": signal.get("platform_status"),
+        "updated_at": format_utc(utc_now()),
+        "direction": signal.get("direction"),
+        "source_candle": format_utc(signal.get("source_candle")),
+        "session_start": signal.get("session_start"),
+        "strategy_mode": signal.get("strategy_mode")
+    }
+
+    atomic_write_json(SIGNAL_STATE_FILE, states)
+
+
+def append_signal_event(signal, event, status=None, platform_status=None, response=None):
+    event_record = {
+        "event": event,
+        "event_time": format_utc(utc_now()),
+        "signal_id": signal.get("signal_id"),
+        "status": status if status is not None else signal.get("status"),
+        "platform_status": platform_status if platform_status is not None else signal.get("platform_status"),
+        "strategy_mode": signal.get("strategy_mode"),
+        "signal": signal
+    }
+    if response is not None:
+        event_record["platform_response"] = response
+
+    with open(SIGNAL_JSONL_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event_record, ensure_ascii=False, default=str) + "\n")
+
+
+def update_signal_status(signal, status, platform_status, event, response=None):
+    signal["status"] = status
+    signal["platform_status"] = platform_status
+    save_signal_state(signal, status=status, platform_status=platform_status)
+    append_signal_event(signal, event, status=status, platform_status=platform_status, response=response)
+
+
+# ============================================================================
+# FILE OUTPUT
+# ============================================================================
+
+def save_price(dt, last, mark=None, index=None, funding=None):
+    with open(PRICE_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            format_utc(dt),
+            DISPLAY_SYMBOL,
+            "" if last is None else f"{last:.8f}",
+            "" if mark is None else f"{mark:.8f}",
+            "" if index is None else f"{index:.8f}",
+            "" if funding is None else f"{funding:.12f}"
+        ])
+
+
+def save_closed_candle(c):
+    with open(CANDLE_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            format_utc(c["time"]),
+            f"{c['open']:.8f}",
+            f"{c['high']:.8f}",
+            f"{c['low']:.8f}",
+            f"{c['close']:.8f}",
+            c.get("samples", 0),
+            c.get("source", "XT_LIVE"),
+            c.get("confirmed", 1)
+        ])
+
+
+def save_session(state):
+    structure_data = state.get("structure", {})
+    with open(SESSION_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            format_utc(state["start"]),
+            format_utc(state["end"]),
+            structure_data.get("structure"),
+            structure_data.get("direction"),
+            state["hyper"].get("high"),
+            state["hyper"].get("low"),
+            state.get("analysis_candles", 0),
+            structure_data.get("score", 0)
+        ])
+
+
+# ============================================================================
+# SESSION PERSISTENCE
+# ============================================================================
+
+def save_current_session_state():
+    global session_state
+    if not session_state:
+        return
+
+    data = {
+        "start": format_utc(session_state.get("start")),
+        "end": format_utc(session_state.get("end")),
+        "ready": session_state.get("ready", False),
+        "boundary_candle_time": format_utc(session_state.get("boundary_candle_time")),
+        "first_signal_candle_time": format_utc(session_state.get("first_signal_candle_time")),
+        "signal_generated": session_state.get("signal_generated", False),
+        "signal_id": session_state.get("signal_id"),
+        "structure_score": session_state.get("structure", {}).get("score", 0),
+        "updated_at": format_utc(utc_now())
+    }
+    atomic_write_json(SESSION_STATE_FILE, data)
+
+
+def restore_session_signal_lock():
+    data = read_json_file(SESSION_STATE_FILE, {})
+    if not isinstance(data, dict):
+        return
+
+    saved_start = data.get("start")
+    if not saved_start:
+        return
+
+    if not data.get("signal_generated", False):
+        return
+
+    try:
+        saved_dt = datetime.strptime(saved_start.replace(" UTC", ""), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        return
+
+    now = utc_now()
+    if session_start_for(now) == saved_dt and session_state is not None:
+        session_state["signal_generated"] = True
+        session_state["signal_id"] = data.get("signal_id")
+        log.info("SESSION SIGNAL LOCK RESTORED: %s", data.get("signal_id"))
+
+
+# ============================================================================
+# PLATFORM QUEUE
+# ============================================================================
+
+def read_platform_queue():
+    ensure_platform_queue_file()
+    signals = []
+
+    try:
+        with open(PLATFORM_QUEUE_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    signal = json.loads(line)
+                    if isinstance(signal, dict):
+                        signal = restore_signal_datetime_fields(signal)
+                        if signal.get("signal_id"):
+                            signals.append(signal)
+                except Exception:
+                    log.warning("Invalid platform queue line ignored.")
+    except Exception as exc:
+        log.error("Could not read platform queue: %s", exc)
+
+    unique = []
+    seen = set()
+    for signal in signals:
+        signal_id = str(signal.get("signal_id"))
+        if signal_id in seen:
+            continue
+        seen.add(signal_id)
+        unique.append(signal)
+    return unique
+
+
+def write_platform_queue(signals):
+    ensure_platform_queue_file()
+    temp = PLATFORM_QUEUE_FILE + ".tmp"
+    try:
+        with open(temp, "w", encoding="utf-8") as f:
+            for signal in signals:
+                f.write(json.dumps(signal, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(temp, PLATFORM_QUEUE_FILE)
+    except Exception as exc:
+        log.error("Could not write platform queue: %s", exc)
+        try:
+            if os.path.exists(temp):
+                os.remove(temp)
+        except Exception:
+            pass
+
+
+def refresh_pending_count():
+    signals = read_platform_queue()
+    with platform_lock:
+        platform_state["pending_count"] = len(signals)
+    return len(signals)
+
+
+def queue_platform_signal(signal):
+    signals = read_platform_queue()
+    signal = restore_signal_datetime_fields(signal)
+    signal_id = str(signal.get("signal_id"))
+
+    existing_ids = {str(x.get("signal_id")) for x in signals}
+    if signal_id not in existing_ids:
+        signals.append(signal)
+
+    write_platform_queue(signals)
+    with platform_lock:
+        platform_state["pending_count"] = len(signals)
+
+
+def remove_platform_signal(signal_id):
+    signals = read_platform_queue()
+    remaining = [x for x in signals if str(x.get("signal_id")) != str(signal_id)]
+    write_platform_queue(remaining)
+    with platform_lock:
+        platform_state["pending_count"] = len(remaining)
+
+
+# ============================================================================
+# PLATFORM HEALTH
+# ============================================================================
+
+def platform_health_check():
+    if not PLATFORM_ENABLED:
+        with platform_lock:
+            platform_state["online"] = False
+            platform_state["last_error"] = "DISABLED"
+        refresh_pending_count()
+        return False
+
+    try:
+        response = platform_http.get(PLATFORM_BASE_URL + PLATFORM_HEALTH_PATH, timeout=PLATFORM_TIMEOUT)
+        if response.status_code != 200:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+
+        status = str(data.get("status", "ok")).lower()
+        if status not in ("ok", "ready", "online", "healthy"):
+            raise RuntimeError(f"Platform unhealthy: {status}")
+
+        with platform_lock:
+            platform_state["online"] = True
+            platform_state["last_check"] = utc_now()
+            platform_state["last_success"] = utc_now()
+            platform_state["last_error"] = None
+
+        refresh_pending_count()
+        return True
+
+    except Exception as exc:
+        with platform_lock:
+            platform_state["online"] = False
+            platform_state["last_check"] = utc_now()
+            platform_state["last_error"] = str(exc)
+        refresh_pending_count()
+        return False
+
+
+# ============================================================================
+# PLATFORM SIGNAL PAYLOAD
+# ============================================================================
+
+def build_platform_payload(signal):
+    return {
+        "type": "SIGNAL",
+        "protocol": "REZA_EXECUTION_PLATFORM_V1",
+        "bot_version": VERSION,
+        "signal_id": signal["signal_id"],
+        "created_at": format_utc(signal["time"]),
+        "time": format_utc(signal["time"]),
+        "source_candle": format_utc(signal["source_candle"]),
+        "symbol": signal["symbol"],
+        "reference_market": signal["reference_market"],
+        "structure": signal["structure"],
+        "structure_direction": signal["structure_direction"],
+        "hyper_high": signal["hyper_high"],
+        "hyper_low": signal["hyper_low"],
+        "direction": signal["direction"],
+        "reference_entry": signal["reference_entry"],
+        "initial_stop": signal["initial_stop"],
+        "initial_risk": signal["initial_risk"],
+        "initial_tp": signal["initial_tp"],
+        "tp_r_multiple": signal["tp_r_multiple"],
+        "entry_type": signal["entry_type"],
+        "candle_type": signal.get("candle_type", ""),
+        "break_type": signal.get("break_type", ""),
+        "strategy_mode": signal.get("strategy_mode", "REVERSE"),
+        "execution_rules": {
+            "entry": "MARKET_TAKER",
+            "initial_stop": "MARKET_TAKER",
+            "take_profit": "LIMIT_MAKER",
+            "tp_r_multiple": TP_R_MULTIPLE,
+            "breakeven_trigger_r": BREAKEVEN_R,
+            "breakeven_fee_adjusted": True
+        },
+        "source": "REZA_BOT",
+        "execution": "REZA_EXECUTION_PLATFORM"
+    }
+
+
+def validate_platform_ack(data, sent_signal_id):
+    if not isinstance(data, dict):
+        return False
+
+    returned_signal_id = data.get("signal_id")
+    if returned_signal_id is None:
+        return False
+
+    if str(returned_signal_id) != str(sent_signal_id):
+        log.error("INVALID PLATFORM ACK: signal_id mismatch. sent=%s returned=%s", sent_signal_id, returned_signal_id)
+        return False
+
+    ack = bool(data.get("ack", False))
+    status = str(data.get("status", "")).lower()
+    already_received = bool(data.get("already_received", False))
+    already_accepted = bool(data.get("already_accepted", False))
+
+    if ack or already_received or already_accepted or status in ("already_received", "already_accepted"):
+        return True
+
+    return False
+
+
+def send_signal_to_platform(signal):
+    if not PLATFORM_ENABLED:
+        update_signal_status(signal, "WAITING_FOR_PLATFORM", "WAITING_FOR_PLATFORM", "PLATFORM_DISABLED")
+        return {"success": False, "status": "PLATFORM_DISABLED"}
+
+    signal = restore_signal_datetime_fields(signal)
+    signal_id = str(signal.get("signal_id"))
+
+    # ================================================================
+    # ✅ بررسی انقضای سیگنال قبل از ارسال
+    # ================================================================
+    if is_signal_expired(signal):
+        log.warning(f"⏰ SIGNAL EXPIRED BEFORE SEND: {signal_id}")
+        update_signal_status(
+            signal,
+            "EXPIRED",
+            "EXPIRED",
+            "SIGNAL_EXPIRED_BEFORE_SEND"
+        )
+        return {"success": False, "status": "EXPIRED"}
+
+    payload = build_platform_payload(signal)
+
+    with platform_delivery_lock:
+        try:
+            response = platform_http.post(
+                PLATFORM_BASE_URL + PLATFORM_SIGNAL_PATH,
+                json=payload,
+                timeout=PLATFORM_TIMEOUT
+            )
+
+            if response.status_code not in (200, 201, 202):
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+
+            try:
+                data = response.json()
+            except Exception:
+                data = {}
+
+            if not validate_platform_ack(data, signal_id):
+                raise RuntimeError(f"Platform response did not contain a valid ACK: {data}")
+
+            with platform_lock:
+                platform_state["online"] = True
+                platform_state["last_success"] = utc_now()
+                platform_state["last_error"] = None
+                platform_state["last_ack_signal"] = signal_id
+
+            remove_platform_signal(signal_id)
+
+            update_signal_status(
+                signal,
+                "READY_FOR_EXECUTION",
+                "ACKNOWLEDGED",
+                "PLATFORM_ACK",
+                response=data
+            )
+
+            return {"success": True, "status": data.get("status", "ACKNOWLEDGED"), "response": data}
+
+        except Exception as exc:
+            with platform_lock:
+                platform_state["online"] = False
+                platform_state["last_error"] = str(exc)
+
+            # ================================================================
+            # ✅ اگر سیگنال منقضی شده باشد، در صف قرار نگیرد
+            # ================================================================
+            if is_signal_expired(signal):
+                log.warning(f"⏰ SIGNAL EXPIRED AFTER ERROR: {signal_id}")
+                update_signal_status(
+                    signal,
+                    "EXPIRED",
+                    "EXPIRED",
+                    "SIGNAL_EXPIRED_AFTER_ERROR"
+                )
+                return {"success": False, "status": "EXPIRED", "error": str(exc)}
+
+            queue_platform_signal(signal)
+
+            update_signal_status(
+                signal,
+                "WAITING_FOR_PLATFORM",
+                "WAITING_FOR_PLATFORM",
+                "DELIVERY_FAILED_PENDING",
+                response={"error": str(exc)}
+            )
+
+            return {"success": False, "status": "WAITING_FOR_PLATFORM", "error": str(exc)}
+
+
+def retry_pending_platform_signals():
+    if not PLATFORM_ENABLED:
+        return
+
+    signals = read_platform_queue()
+
+    with platform_lock:
+        platform_state["pending_count"] = len(signals)
+
+    if not signals:
+        return
+
+    if not platform_health_check():
+        return
+
+    for signal in list(signals):
+        signal = restore_signal_datetime_fields(signal)
+        signal_id = str(signal.get("signal_id"))
+
+        # ================================================================
+        # ✅ بررسی انقضای سیگنال در صف
+        # ================================================================
+        if is_signal_expired(signal):
+            log.warning(f"⏰ SIGNAL EXPIRED IN QUEUE: {signal_id} - REMOVING")
+            
+            remove_platform_signal(signal_id)
+            
+            update_signal_status(
+                signal,
+                "EXPIRED",
+                "EXPIRED",
+                "SIGNAL_EXPIRED_IN_QUEUE"
+            )
+            
+            send_webhook_signal(signal)
+            continue
+
+        update_signal_status(
+            signal,
+            "WAITING_FOR_PLATFORM",
+            "RETRYING",
+            "PLATFORM_RETRY"
+        )
+
+        result = send_signal_to_platform(signal)
+
+        if result.get("success"):
+            print()
+            print("PLATFORM QUEUE SIGNAL DELIVERED")
+            print(f"SIGNAL ID : {signal_id}")
+            print("STATUS    : ACKNOWLEDGED")
+            print()
+
+        else:
+            break
+
+        if PLATFORM_RETRY_SECONDS > 0:
+            time.sleep(PLATFORM_RETRY_SECONDS)
+
+    refresh_pending_count()
+
+
+def platform_monitor_loop():
+    if not PLATFORM_ENABLED:
+        log.warning("Execution Platform connection disabled.")
+        return
+
+    while running:
+        try:
+            online = platform_health_check()
+            if online:
+                retry_pending_platform_signals()
+        except Exception as exc:
+            log.exception("Platform monitor error: %s", exc)
+        time.sleep(PLATFORM_HEALTH_INTERVAL)
+
+
+def start_platform_monitor():
+    if not PLATFORM_ENABLED:
+        return None
+    thread = threading.Thread(target=platform_monitor_loop, name="REZA-PLATFORM-V50.7-MONITOR", daemon=True)
+    thread.start()
+    return thread
+
+
+# ============================================================================
+# WEBHOOK HELPERS
+# ============================================================================
+
+def generate_webhook_signature(payload, secret):
+    if not secret:
+        return None
+    return hmac.new(secret.encode("utf-8"), json.dumps(payload, default=str).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def send_webhook_signal(signal):
+    if not WEBHOOK_ENABLED:
+        return True
+
+    if not WEBHOOK_URL:
+        log.warning("WEBHOOK enabled but URL is empty")
+        return False
+
+    try:
+        signal_copy = restore_signal_datetime_fields(signal.copy())
+        for key in ["time", "source_candle"]:
+            if key in signal_copy and hasattr(signal_copy[key], "isoformat"):
+                signal_copy[key] = signal_copy[key].isoformat()
+
+        payload = {
+            "event": "REZA_SIGNAL",
+            "version": VERSION,
+            "timestamp": format_utc(utc_now()),
+            "signal": signal_copy,
+            "metadata": {
+                "session": {
+                    "start": format_utc(session_state["start"]) if session_state else None,
+                    "end": format_utc(session_state["end"]) if session_state else None,
+                    "structure": session_state.get("structure", {}).get("structure") if session_state else None,
+                    "score": session_state.get("structure", {}).get("score", 0) if session_state else 0
+                },
+                "platform": {
+                    "connected": platform_state.get("online", False),
+                    "pending_count": platform_state.get("pending_count", 0)
+                }
+            }
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "REZA-BOT-V50.7-WEBHOOK"
+        }
+
+        if WEBHOOK_SECRET:
+            signature = generate_webhook_signature(payload, WEBHOOK_SECRET)
+            if signature:
+                headers["X-Webhook-Signature"] = signature
+
+        response = requests.post(WEBHOOK_URL, json=payload, headers=headers, timeout=WEBHOOK_TIMEOUT)
+
+        if response.status_code >= 400:
+            log.error("WEBHOOK failed: HTTP %s - %s", response.status_code, response.text[:500])
+            return False
+
+        log.info("WEBHOOK sent successfully: %s", response.status_code)
+        append_signal_event(signal, "WEBHOOK_SENT", status=signal.get("status"), platform_status=signal.get("platform_status"), response={"status_code": response.status_code, "text": response.text[:500]})
+        return True
+
+    except Exception as exc:
+        log.error("WEBHOOK error: %s", exc)
+        return False
+
+
+# ============================================================================
+# FILE OUTPUT - SIGNAL
+# ============================================================================
+
+def save_signal(signal, platform_status="WAITING_FOR_PLATFORM"):
+    signal = restore_signal_datetime_fields(signal)
+    signal["platform_status"] = platform_status
+    signal["status"] = "WAITING_FOR_PLATFORM"
+    signal_id = signal["signal_id"]
+
+    with open(SIGNAL_FILE, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            signal_id,
+            format_utc(signal["time"]),
+            format_utc(signal["source_candle"]),
+            signal["symbol"],
+            signal["reference_market"],
+            signal["structure"],
+            signal["structure_direction"],
+            f"{signal['hyper_high']:.8f}",
+            f"{signal['hyper_low']:.8f}",
+            signal["direction"],
+            f"{signal['reference_entry']:.8f}",
+            f"{signal['initial_stop']:.8f}",
+            f"{signal['initial_risk']:.8f}",
+            f"{signal['initial_tp']:.8f}",
+            f"{signal['tp_r_multiple']:.4f}",
+            signal["entry_type"],
+            signal.get("candle_type", ""),
+            signal.get("break_type", ""),
+            f"{signal.get('candle_range', 0):.8f}",
+            signal.get("strategy_mode", ""),
+            "SEPARATE_PLATFORM",
+            "WAITING_FOR_PLATFORM",
+            platform_status
+        ])
+
+    save_signal_state(signal, status="WAITING_FOR_PLATFORM", platform_status=platform_status)
+    append_signal_event(signal, "SIGNAL_CREATED", status="WAITING_FOR_PLATFORM", platform_status=platform_status)
+
+
+# ============================================================================
+# NUMERIC UTILITIES
+# ============================================================================
+
+def floor_to_tick(value, tick):
+    v = Decimal(str(value))
+    t = Decimal(str(tick))
+    if t <= 0:
+        return float(v)
+    return float((v / t).to_integral_value(rounding=ROUND_DOWN) * t)
+
+
+# ============================================================================
+# XT INSTRUMENT INFO
+# ============================================================================
+
+instrument_info = {
+    "price_tick": 0.1,
+    "lot_size": 0.01,
+    "min_size": 0.01
+}
+
+
+def normalize_price(price):
+    return floor_to_tick(price, instrument_info["price_tick"])
+
+
+# ============================================================================
+# OKX PUBLIC API (ONLY FOR STARTUP)
+# ============================================================================
+
+def okx_get(path, params=None):
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = http_okx.get(OKX_BASE_URL + path, params=params or {}, timeout=REQUEST_TIMEOUT)
+
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+
+            data = response.json()
+
+            if not isinstance(data, dict):
+                raise RuntimeError("OKX returned non-dict response")
+
+            code = str(data.get("code", ""))
+            if code not in ("", "0"):
+                raise RuntimeError(f"OKX API error {code}: {data.get('msg', '')}")
+
+            return data
+
+        except Exception as exc:
+            last_error = exc
+            if attempt < MAX_RETRIES:
+                time.sleep(min(0.5 * attempt, 3.0))
+
+    raise RuntimeError(f"OKX API failed after {MAX_RETRIES} attempts: {last_error}")
+
+
+# ============================================================================
+# OKX HISTORICAL CANDLES (ONLY FOR STARTUP)
+# ============================================================================
+
+def get_okx_candles(limit=20):
+    data = okx_get("/api/v5/market/history-candles", {"instId": OKX_SYMBOL, "bar": "5m", "limit": str(limit)})
+    rows = data.get("data", [])
+
+    if not rows:
+        raise RuntimeError("OKX returned no historical candles.")
+
+    candles = []
+    for row in rows:
+        if len(row) < 9:
+            continue
+        candles.append({
+            "time": parse_okx_timestamp(row[0]),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5]),
+            "volume_currency": float(row[6]),
+            "volume_quote": float(row[7]),
+            "confirmed": int(row[8]),
+            "samples": 0,
+            "source": "OKX_HISTORY"
+        })
+    candles.sort(key=lambda x: x["time"])
+    return candles
+
+
+# ============================================================================
+# OKX LOAD INITIAL CANDLES (STARTUP ONLY)
+# ============================================================================
+
+def load_initial_12_closed_candles():
+    print()
+    print(f"Loading latest {SESSION_CANDLES} CLOSED 5m candles from OKX (startup only)...")
+
+    raw = get_okx_candles(limit=20)
+    closed = [c for c in raw if c["confirmed"] == 1]
+
+    unique = {}
+    for candle in closed:
+        unique[candle["time"]] = candle
+
+    closed = list(unique.values())
+    closed.sort(key=lambda x: x["time"])
+
+    if len(closed) < SESSION_CANDLES:
+        raise RuntimeError(f"OKX did not provide enough closed candles. Got={len(closed)} Required={SESSION_CANDLES}")
+
+    closed = closed[-SESSION_CANDLES:]
+
+    for candle in closed:
+        if candle["confirmed"] != 1:
+            raise RuntimeError("SAFETY ERROR: unfinished candle entered primary_candles.")
+
+    print(f"✅ Loaded {len(closed)} closed candles from OKX")
+    print(f"   OLDEST: {format_utc(closed[0]['time'])}")
+    print(f"   LATEST: {format_utc(closed[-1]['time'])}")
+    print()
+
+    return closed
+
+
+# ============================================================================
+# XT PUBLIC API (LIVE DATA)
+# ============================================================================
+
+def xt_get(path, params=None):
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = http_xt.get(XT_BASE_URL + path, params=params or {}, timeout=REQUEST_TIMEOUT)
+
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}: {response.text[:1000]}")
+
+            data = response.json()
+
+            if not isinstance(data, dict):
+                raise RuntimeError("XT returned non-dict response")
+
+            code = str(data.get("returnCode", ""))
+            if code not in ("", "0"):
+                raise RuntimeError(f"XT API error {code}: {data.get('msgInfo', '')}")
+
+            return data
+
+        except Exception as exc:
+            last_error = exc
+            if attempt < MAX_RETRIES:
+                time.sleep(min(0.5 * attempt, 3.0))
+
+    raise RuntimeError(f"XT API failed after {MAX_RETRIES} attempts: {last_error}")
+
+
+# ============================================================================
+# XT INSTRUMENT DETAILS
+# ============================================================================
+
+def load_xt_instrument():
+    global instrument_info
+
+    data = xt_get("/future/market/v1/public/symbol/detail", {"symbol": XT_SYMBOL})
+    result = data.get("result", [])
+
+    if not result:
+        raise RuntimeError(f"XT instrument not found: {XT_SYMBOL}")
+
+    if isinstance(result, list):
+        if not result:
+            raise RuntimeError(f"XT instrument not found: {XT_SYMBOL}")
+        x = result[0]
+    else:
+        x = result
+
+    state = x.get("state", 0)
+    if state not in (0, "0") and str(state).lower() not in ("live", "trading"):
+        raise RuntimeError(f"{XT_SYMBOL} is not LIVE. state={state}")
+
+    tick = float(x.get("pricePrecision", 0.1))
+    if tick >= 1:
+        tick = 10 ** (-tick)
+
+    lot = float(x.get("quantityPrecision", 0.01))
+    if lot >= 1:
+        lot = 10 ** (-lot)
+
+    minimum = float(x.get("minQty", 0.01))
+
+    instrument_info = {
+        "price_tick": tick,
+        "lot_size": lot,
+        "min_size": minimum,
+        "state": state
+    }
+
+    return instrument_info
+
+
+# ============================================================================
+# XT TICKER (LIVE PRICE)
+# ============================================================================
+
+def get_xt_ticker():
+    data = xt_get("/future/market/v1/public/q/agg-ticker", {"symbol": XT_SYMBOL})
+    result = data.get("result", {})
+
+    if not result:
+        raise RuntimeError(f"No ticker data for {XT_SYMBOL}")
+
+    ts = result.get("ts")
+    if ts is None:
+        ts = int(time.time() * 1000)
+    parsed_ts = parse_xt_timestamp(ts)
+    if parsed_ts is None:
+        parsed_ts = utc_now()
+
+    return {
+        "last": float(result.get("c", 0)),
+        "ts": parsed_ts,
+        "raw": result
+    }
+
+
+# ============================================================================
+# XT MARK PRICE
+# ============================================================================
+
+def get_xt_mark_price():
+    try:
+        data = xt_get("/future/market/v1/public/q/symbol-mark-price", {"symbol": XT_SYMBOL})
+        result = data.get("result", {})
+
+        if result:
+            if isinstance(result, list):
+                if result:
+                    return float(result[0].get("markPrice", 0))
+            else:
+                return float(result.get("markPrice", 0))
+    except Exception as exc:
+        log.warning("Mark price unavailable: %s", exc)
+
+    return None
+
+
+# ============================================================================
+# XT FUNDING RATE
+# ============================================================================
+
+def get_xt_funding_rate():
+    try:
+        data = xt_get("/future/market/v1/public/q/funding-rate", {"symbol": XT_SYMBOL})
+        result = data.get("result", {})
+
+        if result:
+            if isinstance(result, list):
+                if result:
+                    return float(result[0].get("rate", 0))
+            else:
+                return float(result.get("rate", 0))
+    except Exception as exc:
+        log.warning("Funding unavailable: %s", exc)
+
+    return None
+
+
+# ============================================================================
+# MARKET SNAPSHOT (XT ONLY)
+# ============================================================================
+
+def get_market_snapshot():
+    ticker = get_xt_ticker()
+    return {
+        "last": ticker["last"],
+        "mark": get_xt_mark_price(),
+        "index": get_xt_mark_price(),
+        "funding": get_xt_funding_rate(),
+        "ts": ticker["ts"]
+    }
+
+
+# ============================================================================
+# 5M BUCKET
+# ============================================================================
+
+def bucket_5m(dt):
+    return dt.replace(minute=dt.minute - dt.minute % 5, second=0, microsecond=0)
+
+
+# ============================================================================
+# LIVE CANDLE BUILDER (FROM XT PRICES)
+# ============================================================================
+
+def start_new_candle(bucket, price):
+    return {
+        "time": bucket,
+        "open": price,
+        "high": price,
+        "low": price,
+        "close": price,
+        "samples": 1,
+        "confirmed": 0,
+        "source": "XT_LIVE"
+    }
+
+
+def update_candle(candle, price):
+    candle["high"] = max(candle["high"], price)
+    candle["low"] = min(candle["low"], price)
+    candle["close"] = price
+    candle["samples"] += 1
+
+
+def close_candle(candle):
+    closed = dict(candle)
+    closed["confirmed"] = 1
+    return closed
+
+
+# ============================================================================
+# INITIALIZE CURRENT CANDLE (FROM LAST OKX CLOSE + XT PRICE)
+# ============================================================================
+
+def initialize_current_candle():
+    global current_candle, last_bucket
+
+    print()
+    print("=" * 78)
+    print("INITIALIZING CURRENT CANDLE")
+    print("=" * 78)
+
+    market = get_market_snapshot()
+    now = market["ts"]
+    price = market["last"]
+    bucket = bucket_5m(now)
+
+    if primary_candles:
+        last_candle = primary_candles[-1]
+        if last_candle["time"] < bucket:
+            current_candle = start_new_candle(bucket, price)
+            print(f"🆕 NEW CANDLE: {format_utc(bucket)} from price {price:.2f}")
+        else:
+            current_candle = dict(last_candle)
+            current_candle["confirmed"] = 0
+            current_candle["source"] = "XT_LIVE"
+            update_candle(current_candle, price)
+            print(f"🔄 CONTINUING CANDLE: {format_utc(bucket)} price={price:.2f}")
+    else:
+        current_candle = start_new_candle(bucket, price)
+        print(f"🆕 FIRST CANDLE: {format_utc(bucket)} from price {price:.2f}")
+
+    last_bucket = current_candle["time"]
+
+    print()
+    print("CURRENT LIVE 5M CANDLE (XT PRICES)")
+    print(f"BUCKET     : {format_utc(current_candle['time'])}")
+    print(f"OPEN       : {current_candle['open']:.2f}")
+    print(f"HIGH       : {current_candle['high']:.2f}")
+    print(f"LOW        : {current_candle['low']:.2f}")
+    print(f"CLOSE      : {current_candle['close']:.2f}")
+    print(f"SAMPLES    : {current_candle['samples']}")
+    print("CONFIRM    : 0")
+    print("SOURCE     : XT LIVE")
+    print("STRATEGY   : DUAL MODE")
+    mode = get_strategy_mode()
+    print(f"MODE       : {mode} ({'LIMIT ENTRY' if mode == 'REVERSE' else 'MARKET ENTRY'})")
+    print("=" * 78)
+    print()
+
+
+# ============================================================================
+# SESSION STATE
+# ============================================================================
+
+def prepare_session(start, boundary_candle_time=None):
+    return {
+        "ready": False,
+        "start": start,
+        "end": session_end_for(start),
+        "boundary_candle_time": boundary_candle_time,
+        "first_signal_candle_time": start,
+        "session_closed": False,
+        "active_position": None,
+        "exception_used": False,
+        "signal_generated": False,
+        "signal_id": None,
+        "breakout_checked": False,
+        "analysis_candles": 0,
+        "structure": {
+            "structure": "",
+            "direction": "",
+            "high": None,
+            "low": None,
+            "swing_high": None,
+            "swing_low": None,
+            "strength": 0.0,
+            "analysis_start": None,
+            "analysis_end": None,
+            "structure_candles": 0,
+            "score": 0.0
+        },
+        "hyper": {
+            "high": None,
+            "low": None,
+            "source": ""
+        }
+    }
+
+
+# ============================================================================
+# STRUCTURE HELPERS
+# ============================================================================
+
+def candle_body(c):
+    return abs(c["close"] - c["open"])
+
+
+def candle_range(c):
+    return c["high"] - c["low"]
+
+
+def bullish_candle(c):
+    return c["close"] > c["open"]
+
+
+def bearish_candle(c):
+    return c["close"] < c["open"]
+
+
+def candle_body_ratio(c):
+    total_range = candle_range(c)
+    if total_range <= 0:
+        return 0
+    return candle_body(c) / total_range
+
+
+def calculate_sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+# ============================================================================
+# SWING DETECTION
+# ============================================================================
+
+def find_swing_highs(candles, lookback=2):
+    swings = []
+    for i in range(lookback, len(candles) - lookback):
+        current = candles[i]
+        left_highs = [candles[j]["high"] for j in range(i - lookback, i)]
+        right_highs = [candles[j]["high"] for j in range(i + 1, i + lookback + 1)]
+        if current["high"] >= max(left_highs) and current["high"] >= max(right_highs):
+            swings.append((i, current["high"]))
+    return swings
+
+
+def find_swing_lows(candles, lookback=2):
+    swings = []
+    for i in range(lookback, len(candles) - lookback):
+        current = candles[i]
+        left_lows = [candles[j]["low"] for j in range(i - lookback, i)]
+        right_lows = [candles[j]["low"] for j in range(i + 1, i + lookback + 1)]
+        if current["low"] <= min(left_lows) and current["low"] <= min(right_lows):
+            swings.append((i, current["low"]))
+    return swings
+
+
+# ============================================================================
+# LEG DETECTION
+# ============================================================================
+
+def detect_leg(candles):
+    if len(candles) < 6:
+        return None
+
+    last_three = candles[-3:]
+    preceding_three = candles[-6:-3]
+
+    for c in last_three:
+        if candle_body_ratio(c) < 0.3:
+            return None
+
+    if all(bullish_candle(c) for c in last_three):
+        bearish_count = sum(1 for c in preceding_three if bearish_candle(c))
+        if bearish_count >= 2:
+            return {
+                "type": "LEG",
+                "direction": "LONG",
+                "strength": min(1.0, sum(candle_body(c) for c in last_three) / (max(c["high"] for c in last_three) - min(c["low"] for c in last_three))),
+                "candles": last_three
+            }
+
+    if all(bearish_candle(c) for c in last_three):
+        bullish_count = sum(1 for c in preceding_three if bullish_candle(c))
+        if bullish_count >= 2:
+            return {
+                "type": "LEG",
+                "direction": "SHORT",
+                "strength": min(1.0, sum(candle_body(c) for c in last_three) / (max(c["high"] for c in last_three) - min(c["low"] for c in last_three))),
+                "candles": last_three
+            }
+
+    return None
+
+
+# ============================================================================
+# TREND DETECTION
+# ============================================================================
+
+def detect_trend(candles):
+    if len(candles) < 10:
+        return None
+
+    closes = [c["close"] for c in candles]
+    sma_5 = calculate_sma(closes, 5)
+    sma_10 = calculate_sma(closes, 10)
+
+    if sma_5 is None or sma_10 is None:
+        return None
+
+    if sma_5 > sma_10 * 1.001:
+        direction = "LONG"
+    elif sma_5 < sma_10 * 0.999:
+        direction = "SHORT"
+    else:
+        return None
+
+    start_idx = 0
+    for i in range(len(candles) - 10, 0, -1):
+        test_sma5 = calculate_sma(closes[:i+5], 5)
+        test_sma10 = calculate_sma(closes[:i+10], 10)
+        if test_sma5 and test_sma10:
+            if direction == "LONG" and test_sma5 <= test_sma10 * 1.001:
+                start_idx = i
+                break
+            elif direction == "SHORT" and test_sma5 >= test_sma10 * 0.999:
+                start_idx = i
+                break
+
+    trend_candles = candles[start_idx:]
+    if len(trend_candles) < 5:
+        return None
+
+    high = max(c["high"] for c in trend_candles)
+    low = min(c["low"] for c in trend_candles)
+    range_total = high - low
+
+    if range_total <= 0:
+        strength = 0
+    else:
+        directional_move = abs(trend_candles[-1]["close"] - trend_candles[0]["open"])
+        strength = min(1.0, directional_move / range_total)
+
+    return {
+        "type": "TREND",
+        "direction": direction,
+        "strength": strength,
+        "candles": trend_candles,
+        "start_idx": start_idx
+    }
+
+
+# ============================================================================
+# RANGE DETECTION
+# ============================================================================
+
+def detect_range(candles):
+    if len(candles) < 6:
+        return None
+
+    recent = candles[-6:]
+    high = max(c["high"] for c in recent)
+    low = min(c["low"] for c in recent)
+    range_width = (high - low) / low
+
+    if range_width > 0.03:
+        return None
+
+    max_consecutive = 0
+    current_color = None
+    count = 0
+
+    for c in recent:
+        color = "BULL" if bullish_candle(c) else "BEAR"
+        if color == current_color:
+            count += 1
+            max_consecutive = max(max_consecutive, count)
+        else:
+            current_color = color
+            count = 1
+
+    if max_consecutive >= 3:
+        return None
+
+    start_idx = 0
+    for i in range(len(candles) - 6, 0, -1):
+        test_range = candles[i:i+6]
+        test_high = max(c["high"] for c in test_range)
+        test_low = min(c["low"] for c in test_range)
+        test_width = (test_high - test_low) / test_low
+        if test_width > 0.03:
+            start_idx = i + 1
+            break
+
+    range_candles = candles[start_idx:]
+    if len(range_candles) < 4:
+        return None
+
+    final_high = max(c["high"] for c in range_candles)
+    final_low = min(c["low"] for c in range_candles)
+    final_width = (final_high - final_low) / final_low
+
+    if final_width > 0.03:
+        return None
+
+    return {
+        "type": "RANGE",
+        "direction": "RANGE",
+        "strength": 0.0,
+        "candles": range_candles,
+        "high": final_high,
+        "low": final_low
+    }
+
+
+# ============================================================================
+# STRUCTURE SCORING
+# ============================================================================
+
+def calculate_leg_score(candles, leg_result):
+    if not leg_result:
+        return 0.0
+
+    score = 0.0
+    body_sizes = [candle_body_ratio(c) for c in leg_result.get("candles", [])]
+    if body_sizes:
+        avg_body = sum(body_sizes) / len(body_sizes)
+        score += min(0.5, avg_body * 0.5)
+
+    if len(candles) >= 8:
+        closes = [c["close"] for c in candles]
+        sma_5 = calculate_sma(closes, 5)
+        sma_10 = calculate_sma(closes, 10)
+        if sma_5 and sma_10:
+            direction = leg_result.get("direction", "")
+            if direction == "LONG" and sma_5 > sma_10:
+                score += 0.3
+            elif direction == "SHORT" and sma_5 < sma_10:
+                score += 0.3
+
+    score += min(0.2, leg_result.get("strength", 0) * 0.2)
+    return min(1.0, score)
+
+
+def calculate_trend_score(candles, trend_result):
+    if not trend_result:
+        return 0.0
+
+    score = 0.0
+    closes = [c["close"] for c in candles]
+    sma_5 = calculate_sma(closes, 5)
+    sma_10 = calculate_sma(closes, 10)
+    if sma_5 and sma_10 and sma_10 > 0:
+        divergence = abs(sma_5 - sma_10) / sma_10
+        score += min(0.4, divergence * 20)
+
+    trend_candles = trend_result.get("candles", [])
+    length_score = min(0.3, len(trend_candles) / 20 * 0.3)
+    score += length_score
+    score += min(0.3, trend_result.get("strength", 0) * 0.3)
+
+    return min(1.0, score)
+
+
+def calculate_range_score(candles, range_result):
+    if not range_result:
+        return 0.0
+
+    score = 0.0
+    range_candles = range_result.get("candles", [])
+    if range_candles:
+        high = max(c["high"] for c in range_candles)
+        low = min(c["low"] for c in range_candles)
+        if low > 0:
+            volatility = (high - low) / low
+            score += max(0, 0.5 - volatility * 10)
+
+    length_score = min(0.3, len(range_candles) / 10 * 0.3)
+    score += length_score
+
+    if range_candles:
+        bulls = sum(1 for c in range_candles if bullish_candle(c))
+        bears = len(range_candles) - bulls
+        if bulls > 0 and bears > 0:
+            ratio = min(bulls, bears) / len(range_candles)
+            score += ratio * 0.2
+
+    return min(1.0, score)
+
+
+# ============================================================================
+# MAIN STRUCTURE DETECTION
+# ============================================================================
+
+def calculate_structure(candles):
+    if len(candles) != SESSION_CANDLES:
+        return None
+
+    if any(c.get("confirmed") != 1 for c in candles):
+        return None
+
+    leg_result = detect_leg(candles)
+    trend_result = detect_trend(candles)
+    range_result = detect_range(candles)
+
+    patterns = []
+
+    if leg_result:
+        score = calculate_leg_score(candles, leg_result)
+        patterns.append({
+            "structure": "LEG",
+            "direction": leg_result["direction"],
+            "score": score,
+            "result": leg_result
+        })
+
+    if trend_result:
+        score = calculate_trend_score(candles, trend_result)
+        patterns.append({
+            "structure": "BULLISH" if trend_result["direction"] == "LONG" else "BEARISH",
+            "direction": trend_result["direction"],
+            "score": score,
+            "result": trend_result
+        })
+
+    if range_result:
+        score = calculate_range_score(candles, range_result)
+        patterns.append({
+            "structure": "RANGE",
+            "direction": "RANGE",
+            "score": score,
+            "result": range_result
+        })
+
+    if not patterns:
+        fallback = {
+            "structure": "RANGE",
+            "direction": "RANGE",
+            "score": 0.0,
+            "result": None
+        }
+        patterns.append(fallback)
+
+    best = max(patterns, key=lambda p: p["score"])
+
+    if best["result"]:
+        result = best["result"]
+        candles_data = result.get("candles", candles)
+    else:
+        candles_data = candles
+
+    high = max(c["high"] for c in candles_data)
+    low = min(c["low"] for c in candles_data)
+
+    return {
+        "structure": best["structure"],
+        "direction": best["direction"],
+        "high": high,
+        "low": low,
+        "swing_high": high,
+        "swing_low": low,
+        "strength": best["score"],
+        "score": best["score"],
+        "analysis_start": candles_data[0]["time"] if candles_data else candles[0]["time"],
+        "analysis_end": candles_data[-1]["time"] if candles_data else candles[-1]["time"],
+        "structure_candles": len(candles_data)
+    }
+
+
+# ============================================================================
+# STRUCTURE-DERIVED HYPER
+# ============================================================================
+
+def calculate_hyper_from_structure(candles, structure):
+    if not candles or not structure:
+        return None
+
+    structure_type = structure["structure"]
+
+    if structure_type in ["BULLISH", "LEG"] and structure.get("direction") == "LONG":
+        start_time = structure.get("analysis_start")
+        selected = candles
+        if start_time is not None:
+            selected = [c for c in candles if c["time"] >= start_time]
+        if not selected:
+            selected = candles
+
+        high = max(c["high"] for c in selected)
+        low = min(c["low"] for c in selected)
+
+        if high > low:
+            return {
+                "high": high,
+                "low": low,
+                "source": f"{structure_type}_LONG_LOCKED"
+            }
+
+    if structure_type in ["BEARISH", "LEG"] and structure.get("direction") == "SHORT":
+        start_time = structure.get("analysis_start")
+        selected = candles
+        if start_time is not None:
+            selected = [c for c in candles if c["time"] >= start_time]
+        if not selected:
+            selected = candles
+
+        high = max(c["high"] for c in selected)
+        low = min(c["low"] for c in selected)
+
+        if high > low:
+            return {
+                "high": high,
+                "low": low,
+                "source": f"{structure_type}_SHORT_LOCKED"
+            }
+
+    if structure_type == "RANGE":
+        start_time = structure.get("analysis_start")
+        end_time = structure.get("analysis_end")
+        selected = candles
+
+        if start_time is not None and end_time is not None:
+            selected = [c for c in candles if c["time"] >= start_time and c["time"] <= end_time]
+
+        if not selected:
+            selected = candles
+
+        high = max(c["high"] for c in selected)
+        low = min(c["low"] for c in selected)
+
+        if high > low:
+            return {
+                "high": high,
+                "low": low,
+                "source": "RANGE_LOCKED"
+            }
+
+    return None
+
+
+# ============================================================================
+# SESSION LEVELS
+# ============================================================================
+
+def get_previous_12_closed_candles():
+    if len(primary_candles) < SESSION_CANDLES:
+        return None
+
+    analysis = list(primary_candles[-SESSION_CANDLES:])
+
+    if len(analysis) != SESSION_CANDLES:
+        return None
+
+    if any(c.get("confirmed") != 1 for c in analysis):
+        return None
+
+    latest = analysis[-1]
+    if latest["time"].minute != 55:
+        return None
+    if latest["time"].second != 0:
+        return None
+
+    return analysis
+
+
+def setup_session_locked_levels(state):
+    state["ready"] = False
+    state["structure"] = None
+    state["hyper"] = None
+    state["analysis_candles"] = 0
+
+    analysis = get_previous_12_closed_candles()
+    if not analysis:
+        log.error("SESSION INIT FAILED: 12 CLOSED candles unavailable.")
+        return False
+
+    if len(analysis) != SESSION_CANDLES:
+        log.error("SESSION INIT FAILED: expected=%s got=%s", SESSION_CANDLES, len(analysis))
+        return False
+
+    for candle in analysis:
+        if candle.get("confirmed") != 1:
+            log.error("SESSION INIT FAILED: unfinished candle found.")
+            return False
+
+    structure = calculate_structure(analysis)
+    if not structure:
+        log.error("SESSION INIT FAILED: Structure unavailable.")
+        return False
+
+    log.info(
+        "STRUCTURE DETECTED: type=%s direction=%s score=%.2f candles=%s",
+        structure.get("structure"),
+        structure.get("direction"),
+        structure.get("score", 0),
+        structure.get("structure_candles", 0)
+    )
+
+    debug_data = {
+        "time": format_utc(utc_now()),
+        "structure": structure,
+        "analysis": [{"time": format_utc(c["time"]), "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"]} for c in analysis]
+    }
+    with open(STRUCTURE_DEBUG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(debug_data, default=str) + "\n")
+
+    hyper = calculate_hyper_from_structure(analysis, structure)
+    if not hyper:
+        log.error("SESSION INIT FAILED: Hyper unavailable | structure=%s", structure)
+        return False
+
+    hyper_high = hyper.get("high")
+    hyper_low = hyper.get("low")
+
+    if hyper_high is None or hyper_low is None:
+        log.error("SESSION INIT FAILED: Hyper High/Low missing.")
+        return False
+
+    if hyper_high <= hyper_low:
+        log.error("SESSION INIT FAILED: Invalid Hyper range | high=%s low=%s", hyper_high, hyper_low)
+        return False
+
+    state["structure"] = structure
+    state["hyper"] = hyper
+    state["analysis_candles"] = len(analysis)
+    state["ready"] = True
+
+    save_session(state)
+    save_current_session_state()
+
+    log.info(
+        "SESSION READY | start=%s | analysis=%s | structure=%s | direction=%s | score=%.2f | hyper_high=%s | hyper_low=%s | source=%s",
+        format_utc(state["start"]),
+        len(analysis),
+        structure.get("structure"),
+        structure.get("direction"),
+        structure.get("score", 0),
+        hyper_high,
+        hyper_low,
+        hyper.get("source")
+    )
+
+    return True
+
+
+# ============================================================================
+# SESSION ROLLOVER
+# ============================================================================
+
+def rollover_session_if_needed(new_start, boundary_candle_time=None):
+    global session_state, last_session_start, startup_waiting_for_session
+
+    if last_session_start == new_start and session_state is not None and session_state.get("ready", False):
+        return True
+
+    new_state = prepare_session(new_start, boundary_candle_time=boundary_candle_time)
+    ready = setup_session_locked_levels(new_state)
+
+    if not ready:
+        new_state["ready"] = False
+        session_state = new_state
+        last_session_start = None
+        startup_waiting_for_session = True
+        log.error("SESSION INIT FAILED | start=%s | Hyper was not locked.", format_utc(new_start))
+        save_current_session_state()
+        return False
+
+    session_state = new_state
+    last_session_start = new_start
+    startup_waiting_for_session = False
+    restore_session_signal_lock()
+
+    mode = get_strategy_mode()
+
+    print()
+    print("=" * 78)
+    print("NEW V50.7 SESSION (DUAL MODE)")
+    print(f"START          : {format_utc(session_state['start'])}")
+    print(f"END            : {format_utc(session_state['end'])}")
+    print(f"BOUNDARY       : {format_utc(session_state.get('boundary_candle_time'))}")
+    print(f"ANALYSIS       : {session_state['analysis_candles']} CLOSED 5M")
+    print(f"STRUCTURE      : {session_state['structure'].get('structure')}")
+    print(f"DIRECTION      : {session_state['structure'].get('direction')}")
+    print(f"SCORE          : {session_state['structure'].get('score', 0):.2f}")
+    print(f"STRUCTURE HIGH : {session_state['structure'].get('high')}")
+    print(f"STRUCTURE LOW  : {session_state['structure'].get('low')}")
+    print(f"HYPER HIGH     : {session_state['hyper'].get('high')}")
+    print(f"HYPER LOW      : {session_state['hyper'].get('low')}")
+    print(f"HYPER SOURCE   : {session_state['hyper'].get('source')}")
+    print(f"CURRENT MODE   : {mode} ({'LIMIT ENTRY' if mode == 'REVERSE' else 'MARKET ENTRY'})")
+    print("DATA           : OKX (STARTUP) + XT (LIVE)")
+    print("EXECUTION      : XT BTCUSDT")
+    print("STRATEGY READY : TRUE")
+    print("BOUNDARY SIGNAL: BLOCKED")
+    print("FIRST NEW CANDLE: ENABLED")
+    print("SIGNAL LIMIT   : 1 PER SESSION")
+    print("SIGNAL EXPIRY  : 5 MINUTES")
+    print("SESSION END    : POSITIONS REMAIN OPEN")
+    print("=" * 78)
+    print()
+
+    return True
+
+
+# ============================================================================
+# 🔥 SIGNAL DETECTION - DUAL MODE (REVERSE / TREND)
+# ============================================================================
+
+def detect_signal(candle, session_state):
+    """
+    تشخیص سیگنال با دو حالت:
+    - REVERSE: برعکس کندل شکست (Fake Breakout)
+    - TREND: همراه کندل شکست (Trend Following)
+    """
+    if candle is None:
+        return None
+
+    if candle.get("confirmed", 0) != 1:
+        return None
+
+    if session_state is None:
+        return None
+
+    if not session_state.get("ready", False):
+        return None
+
+    if session_state.get("signal_generated", False):
+        return None
+
+    hyper = session_state.get("hyper")
+    if not isinstance(hyper, dict):
+        return None
+
+    hyper_high = hyper.get("high")
+    hyper_low = hyper.get("low")
+
+    if hyper_high is None or hyper_low is None:
+        return None
+
+    high = float(candle["high"])
+    low = float(candle["low"])
+    open_price = float(candle["open"])
+    close = float(candle["close"])
+
+    # ================================================================
+    # تشخیص نوع کندل (صعودی/نزولی)
+    # ================================================================
+    is_bullish = close > open_price
+    is_bearish = close < open_price
+
+    if not is_bullish and not is_bearish:
+        is_bearish = True
+
+    # ================================================================
+    # تشخیص عبور از Hyper
+    # ================================================================
+    broke_high = high >= float(hyper_high) and close > float(hyper_high)
+    broke_low = low <= float(hyper_low) and close < float(hyper_low)
+
+    if not broke_high and not broke_low:
+        return None
+
+    # ================================================================
+    # تشخیص حالت معاملاتی بر اساس ساعت
+    # ================================================================
+    mode = get_strategy_mode()
+    
+    log.info(f"📊 STRATEGY MODE: {mode} at hour {utc_now().hour:02d}:00 UTC")
+
+    # ================================================================
+    # محاسبه R = 2 × (High - Low) با محدودیت 250
+    # ================================================================
+    candle_range_value = high - low
+    r = candle_range_value * 2
+    
+    if r > MAX_R:
+        log.info(f"R capped at {MAX_R} (original: {r:.2f})")
+        r = float(MAX_R)
+
+    if r < 5:
+        log.info(f"R too small ({r:.2f}), using minimum 5")
+        r = 5.0
+
+    # ================================================================
+    # تعیین جهت پوزیشن بر اساس حالت
+    # ================================================================
+    if mode == "REVERSE":
+        # برعکس کندل شکست
+        if is_bullish:
+            direction = "SHORT"
+        else:
+            direction = "LONG"
+    else:  # TREND
+        # همراه کندل شکست
+        if is_bullish:
+            direction = "LONG"
+        else:
+            direction = "SHORT"
+
+    entry = close
+
+    if direction == "LONG":
+        initial_stop = entry - r
+        initial_tp = entry + (r * TP_R_MULTIPLE)
+    else:
+        initial_stop = entry + r
+        initial_tp = entry - (r * TP_R_MULTIPLE)
+
+    # ================================================================
+    # لاگ اطلاعات
+    # ================================================================
+    log.info(
+        "📊 BREAKOUT DETECTED: mode=%s candle_type=%s break_type=%s R=%.2f direction=%s entry=%.2f",
+        mode,
+        "BULLISH" if is_bullish else "BEARISH",
+        "HIGH_BREAK" if broke_high else "LOW_BREAK",
+        r,
+        direction,
+        entry
+    )
+
+    return {
+        "direction": direction,
+        "entry": entry,
+        "candle": candle,
+        "hyper_high": float(hyper_high),
+        "hyper_low": float(hyper_low),
+        "r": r,
+        "candle_range": candle_range_value,
+        "candle_type": "BULLISH" if is_bullish else "BEARISH",
+        "break_type": "HIGH_BREAK" if broke_high else "LOW_BREAK",
+        "strategy_mode": mode
+    }
+
+
+# ============================================================================
+# BUILD REFERENCE SIGNAL
+# ============================================================================
+
+def build_reference_signal(strategy_signal, breakout_candle):
+    if strategy_signal is None or breakout_candle is None:
+        return None
+
+    direction = strategy_signal.get("direction")
+    if direction not in ("LONG", "SHORT"):
+        return None
+
+    entry = float(strategy_signal["entry"])
+    r = float(strategy_signal["r"])
+    breakout_time = breakout_candle["time"]
+
+    if direction == "LONG":
+        initial_stop = entry - r
+        initial_tp = entry + (r * TP_R_MULTIPLE)
+    else:
+        initial_stop = entry + r
+        initial_tp = entry - (r * TP_R_MULTIPLE)
+
+    signal_id = f"REZA-{direction}-{breakout_time.strftime('%Y%m%d%H%M')}"
+
+    structure_data = session_state.get("structure", {})
+    if not isinstance(structure_data, dict):
+        structure_data = {}
+
+    signal = {
+        "signal_id": signal_id,
+        "time": utc_now(),
+        "source_candle": breakout_time,
+        "symbol": DISPLAY_SYMBOL,
+        "reference_market": "XT BTCUSDT (DATA + EXECUTION)",
+        "structure": structure_data.get("structure", ""),
+        "structure_direction": structure_data.get("direction", ""),
+        "hyper_high": float(strategy_signal["hyper_high"]),
+        "hyper_low": float(strategy_signal["hyper_low"]),
+        "direction": direction,
+        "reference_entry": entry,
+        "initial_stop": initial_stop,
+        "initial_risk": r,
+        "initial_tp": initial_tp,
+        "tp_r_multiple": TP_R_MULTIPLE,
+        "entry_type": "BREAKOUT_DUAL_MODE",
+        "candle_type": strategy_signal.get("candle_type"),
+        "break_type": strategy_signal.get("break_type"),
+        "candle_range": strategy_signal.get("candle_range"),
+        "strategy_mode": strategy_signal.get("strategy_mode"),
+        "structure_score": structure_data.get("score", 0)
+    }
+
+    log.info(
+        "🔥 SIGNAL CREATED | id=%s | mode=%s | direction=%s | entry=%s | stop=%s | R=%s | TP=%s",
+        signal_id,
+        signal.get("strategy_mode"),
+        direction,
+        entry,
+        initial_stop,
+        r,
+        initial_tp
+    )
+
+    return signal
+
+
+# ============================================================================
+# EMIT SIGNAL
+# ============================================================================
+
+def emit_signal(signal):
+    global last_signal
+
+    if signal is None:
+        return
+
+    if is_signal_expired(signal):
+        log.warning(f"⏰ SIGNAL EXPIRED: {signal.get('signal_id')}")
+        return
+
+    if session_state is None:
+        log.error("SIGNAL BLOCKED: no active session state.")
+        return
+
+    if session_state.get("signal_generated", False):
+        log.warning("SIGNAL BLOCKED: a signal has already been generated in this session.")
+        return
+
+    session_state["signal_generated"] = True
+    session_state["signal_id"] = signal.get("signal_id")
+    save_current_session_state()
+
+    last_signal = signal
+    save_signal(signal, "WAITING_FOR_PLATFORM")
+    queue_platform_signal(signal)
+    update_signal_status(signal, "WAITING_FOR_PLATFORM", "WAITING_FOR_PLATFORM", "ADDED_TO_PENDING")
+
+    result = send_signal_to_platform(signal)
+    send_webhook_signal(signal)
+
+    mode = signal.get("strategy_mode", "UNKNOWN")
+
+    print()
+    print()
+    print("=" * 78)
+    print(f"🔥 REZA BOT V50.7 — NEW SIGNAL (DUAL MODE)")
+    print("=" * 78)
+    print(f"STRATEGY MODE    : {mode}")
+    print(f"SIGNAL ID        : {signal['signal_id']}")
+    print(f"TIME             : {format_utc(signal['time'])}")
+    print(f"SYMBOL           : {signal['symbol']}")
+    print(f"SESSION          : {format_utc(session_state['start'])}")
+    print(f"STRUCTURE        : {signal['structure']}")
+    print(f"STRUCTURE SCORE  : {signal.get('structure_score', 0):.2f}")
+    print(f"HYPER HIGH       : {signal['hyper_high']:.2f}")
+    print(f"HYPER LOW        : {signal['hyper_low']:.2f}")
+    print(f"DIRECTION        : {signal['direction']}")
+    print(f"CANDLE TYPE      : {signal.get('candle_type')}")
+    print(f"BREAK TYPE       : {signal.get('break_type')}")
+    print(f"R                : {signal['initial_risk']:.2f}")
+    print(f"REFERENCE ENTRY  : {signal['reference_entry']:.2f}")
+    print(f"INITIAL STOP     : {signal['initial_stop']:.2f}")
+    print(f"INITIAL TP       : {signal['initial_tp']:.2f}")
+    print(f"ENTRY TYPE       : {signal['entry_type']}")
+    print(f"SOURCE CANDLE    : {format_utc(signal['source_candle'])}")
+    print("EXECUTION        : SEPARATE PLATFORM (XT)")
+    print("SESSION LOCK     : TRUE — NO MORE SIGNALS THIS SESSION")
+    print(f"SIGNAL EXPIRY    : {SIGNAL_EXPIRY_SECONDS}s")
+
+    if result.get("success"):
+        print("PLATFORM         : CONNECTED ✅")
+        print("STATUS           : READY FOR EXECUTION")
+    else:
+        print("PLATFORM         : NOT AVAILABLE ❌")
+        print("STATUS           : WAITING FOR PLATFORM")
+
+    print(f"PENDING COUNT    : {platform_state.get('pending_count', 0)}")
+    print("=" * 78)
+    print()
+
+
+# ============================================================================
+# LIVE PRICE PROCESSOR
+# ============================================================================
+
+def process_live_market(market):
+    global current_candle, last_bucket, last_price, market_state, primary_candles, session_state, last_session_start, startup_waiting_for_session
+
+    try:
+        price = market["last"]
+        now = market["ts"]
+        
+        if now is None:
+            now = utc_now()
+
+        last_price = price
+        market_state = market
+        market_state["ts"] = now
+
+        save_price(now, market["last"], market.get("mark"), market.get("index"), market.get("funding"))
+
+        bucket = bucket_5m(now)
+
+        if current_candle is None:
+            initialize_current_candle()
+            return
+
+        if bucket == last_bucket:
+            update_candle(current_candle, price)
+            return
+
+        # ================================================================
+        # HH:55 - Session Reset
+        # ================================================================
+        if bucket.minute == 55 and last_bucket is not None and last_bucket != bucket:
+            session_state = None
+            last_session_start = None
+            startup_waiting_for_session = True
+            log.info("HH:55 OPEN | SESSION RESET | HH:55 CLOSE WILL CREATE NEW HYPER")
+
+        # ================================================================
+        # بستن کندل قبلی
+        # ================================================================
+        previous = close_candle(current_candle)
+        previous["confirmed"] = 1
+
+        new_closed_candle = False
+
+        if not primary_candles or previous["time"] > primary_candles[-1]["time"]:
+            primary_candles.append(previous)
+            if len(primary_candles) > MAX_PRIMARY_CANDLES:
+                primary_candles = primary_candles[-MAX_PRIMARY_CANDLES:]
+
+            save_closed_candle(previous)
+            new_closed_candle = True
+
+            print(
+                f"5M CLOSED | {format_utc(previous['time'])} | "
+                f"O={previous['open']:.2f} H={previous['high']:.2f} L={previous['low']:.2f} C={previous['close']:.2f} | "
+                f"samples={previous.get('samples', 0)} | closed_history={len(primary_candles)}"
+            )
+
+        # ================================================================
+        # بررسی Session جدید (HH:00)
+        # ================================================================
+        new_session_start = session_start_for(bucket)
+        current_session_start = None
+
+        if session_state is not None:
+            current_session_start = session_state.get("start")
+
+        is_hh00_candle_close = (
+            previous.get("confirmed") == 1
+            and previous["time"].minute == 0
+            and previous["time"].second == 0
+        )
+
+        session_is_new = (
+            is_hh00_candle_close
+            and current_session_start != new_session_start
+        )
+
+        if session_is_new:
+            print()
+            print("=" * 78)
+            print("HH:00 CANDLE CLOSED — NEW SESSION")
+            print(f"NEW SESSION   : {format_utc(new_session_start)}")
+            print(f"HH:00 CLOSED  : {format_utc(previous['time'])}")
+            print(f"CLOSED HISTORY: {len(primary_candles)}")
+            print("HYPER INPUT   : HH:55 + 11 PREVIOUS CLOSED CANDLES")
+            print("=" * 78)
+
+            rollover_session_if_needed(new_session_start, previous["time"])
+
+        # ================================================================
+        # تشخیص سیگنال روی کندل بسته شده
+        # ================================================================
+        if (
+            session_state is not None
+            and session_state.get("ready", False)
+            and new_closed_candle
+            and not session_is_new
+        ):
+            previous_session = session_start_for(previous["time"])
+            active_session = session_state.get("start")
+            boundary_time = session_state.get("boundary_candle_time")
+
+            candle_belongs_to_active_session = (
+                active_session is not None
+                and previous_session == active_session
+                and (boundary_time is None or previous["time"] > boundary_time)
+            )
+
+            if candle_belongs_to_active_session:
+                strategy_signal = detect_signal(previous, session_state)
+                if strategy_signal:
+                    signal = build_reference_signal(strategy_signal, previous)
+                    if signal:
+                        emit_signal(signal)
+
+        # ================================================================
+        # شروع کندل جدید
+        # ================================================================
+        current_candle = start_new_candle(bucket, price)
+        last_bucket = bucket
+
+        mode = get_strategy_mode()
+        print()
+        print("NEW LIVE 5M CANDLE (XT PRICES)")
+        print(f"BUCKET     : {format_utc(bucket)}")
+        print(f"OPEN       : {price:.2f}")
+        print("CONFIRM    : 0")
+        print(f"MODE       : {mode} ({'LIMIT ENTRY' if mode == 'REVERSE' else 'MARKET ENTRY'})")
+
+        if session_state is not None and session_state.get("ready", False):
+            structure_data = session_state.get("structure", {})
+            hyper_data = session_state.get("hyper", {})
+            print(f"STRUCTURE  : {structure_data.get('structure', 'N/A')}")
+            print(f"SCORE      : {structure_data.get('score', 0):.2f}")
+            print(f"HYPER_H    : {hyper_data.get('high')}")
+            print(f"HYPER_L    : {hyper_data.get('low')}")
+            print("STRATEGY   : ACTIVE — CLOSED CANDLE INPUT")
+        else:
+            print("STRATEGY   : WAITING FOR SESSION LEVELS")
+
+        print()
+
+    except Exception as exc:
+        log.error(f"🔥 process_live_market ERROR: {exc}")
+        print(f"[ERROR] process_live_market: {exc}")
+        traceback.print_exc()
+
+
+# ============================================================================
+# 🔥 LIVE STATUS - FIXED
+# ============================================================================
+
+def print_live_status():
+    """نمایش وضعیت لحظه‌ای - اصلاح شده برای جلوگیری از خطای NoneType"""
+    
+    if current_candle is None:
+        print("⏳ Waiting for initial candle...")
+        return
+
+    # ================================================================
+    # ✅ بررسی session_state قبل از دسترسی
+    # ================================================================
+    if session_state and session_state.get("ready", False):
+        session_status = "READY"
+    else:
+        session_status = "WAITING_FOR_SESSION"
+
+    mode = get_strategy_mode()
+    structure = ""
+    direction = ""
+    score = 0.0
+    hyper_high = None
+    hyper_low = None
+    signal_generated = False
+
+    # ✅ فقط اگر session_state وجود داشت و dict بود
+    if session_state is not None and isinstance(session_state, dict):
+        structure_data = session_state.get("structure")
+        hyper_data = session_state.get("hyper")
+        
+        if structure_data and isinstance(structure_data, dict):
+            structure = structure_data.get("structure", "")
+            direction = structure_data.get("direction", "")
+            score = structure_data.get("score", 0.0)
+        
+        if hyper_data and isinstance(hyper_data, dict):
+            hyper_high = hyper_data.get("high")
+            hyper_low = hyper_data.get("low")
+        
+        signal_generated = session_state.get("signal_generated", False)
+
+    with platform_lock:
+        platform_online = platform_state["online"]
+        pending_count = platform_state["pending_count"]
+
+    platform_status = "CONNECTED" if platform_online else "WAITING"
+
+    print(
+        f"{utc_now().strftime('%H:%M:%S')} UTC | "
+        f"MODE={mode} | "
+        f"XT {DISPLAY_SYMBOL} | "
+        f"LAST={last_price:.2f} | "
+        f"LIVE5M O={current_candle['open']:.2f} "
+        f"H={current_candle['high']:.2f} "
+        f"L={current_candle['low']:.2f} "
+        f"C={current_candle['close']:.2f} | "
+        f"SAMPLES={current_candle['samples']} | "
+        f"CLOSED={len(primary_candles)} | "
+        f"SESSION={session_status} | "
+        f"STRUCTURE={structure} | "
+        f"SCORE={score:.2f} | "
+        f"HYPER_H={hyper_high} | "
+        f"HYPER_L={hyper_low} | "
+        f"SIGNAL_LOCK={signal_generated} | "
+        f"PLATFORM={platform_status} | "
+        f"PENDING={pending_count}"
+    )
+
+
+# ============================================================================
+# CONNECTION DIAGNOSTIC
+# ============================================================================
+
+def test_connection():
+    print()
+    print("=" * 78)
+    print("XT REFERENCE MARKET DIAGNOSTIC (LIVE DATA)")
+    print("=" * 78)
+
+    try:
+        instrument = load_xt_instrument()
+        print(f"INSTRUMENT       : {XT_SYMBOL}")
+        print(f"STATE            : {instrument['state']}")
+        print(f"TICK SIZE        : {instrument['price_tick']}")
+        print(f"LOT SIZE         : {instrument['lot_size']}")
+        print(f"MIN SIZE         : {instrument['min_size']}")
+    except Exception as exc:
+        print(f"INSTRUMENT       : ERROR - {exc}")
+
+    try:
+        market = get_market_snapshot()
+        print(f"LIVE PRICE       : {market['last']:.2f}")
+        print(f"LIVE TIMESTAMP   : {format_utc(market['ts'])}")
+        if market["mark"] is not None:
+            print(f"MARK PRICE       : {market['mark']:.2f}")
+        if market["funding"] is not None:
+            print(f"FUNDING RATE     : {market['funding']:.12f}")
+    except Exception as exc:
+        print(f"MARKET SNAPSHOT  : ERROR - {exc}")
+
+    mode = get_strategy_mode()
+    print(f"CURRENT MODE     : {mode}")
+    print(f"  REVERSE HOURS  : 00-06, 20-23 UTC")
+    print(f"  TREND HOURS    : 06-20 UTC")
+    print("PUBLIC API       : OK")
+    print("OKX USED ONLY    : STARTUP (12 candles)")
+    print("LIVE DATA        : XT (ticker + candles)")
+    print("ORDERS           : DISABLED (Handled by XT Platform)")
+    print("=" * 78)
+    print()
+
+
+def test_platform_connection():
+    print()
+    print("=" * 78)
+    print("REZA EXECUTION PLATFORM CONNECTION")
+    print("=" * 78)
+    print(f"PLATFORM URL     : {PLATFORM_BASE_URL}")
+    print(f"HEALTH ENDPOINT  : {PLATFORM_HEALTH_PATH}")
+    print(f"SIGNAL ENDPOINT  : {PLATFORM_SIGNAL_PATH}")
+
+    if not PLATFORM_ENABLED:
+        print("STATUS           : DISABLED")
+        print("=" * 78)
+        print()
+        return False
+
+    online = platform_health_check()
+
+    if online:
+        print("STATUS           : CONNECTED ✅")
+        print("SIGNAL CHANNEL   : READY")
+        print("EXECUTION        : XT BTCUSDT USDT-M")
+    else:
+        with platform_lock:
+            error = platform_state["last_error"]
+        print("STATUS           : NOT CONNECTED ❌")
+        print(f"REASON           : {error}")
+        print("SIGNALS          : WILL BE QUEUED")
+
+    print("ORDERS FROM BOT  : DISABLED")
+    print("PRIVATE EXCHANGE : PLATFORM ONLY")
+    print("=" * 78)
+    print()
+
+    return online
+
+
+# ============================================================================
+# STARTUP SUMMARY
+# ============================================================================
+
+def print_startup_summary():
+    print()
+    print("=" * 78)
+    print(f"REZA BOT {VERSION}")
+    print("=" * 78)
+    print("DATA SOURCE      : OKX (STARTUP) + XT (LIVE)")
+    print("EXECUTION        : XT BTCUSDT USDT-M")
+    print("TIMEFRAME        : 5M")
+    print("SESSION          : HH:00 UTC")
+    print("STRATEGY         : DUAL MODE")
+    print("  - REVERSE (00-06, 20-23 UTC): برعکس کندل شکست")
+    print("  - TREND   (06-20 UTC): همراه کندل شکست")
+    print(f"  - Max R = {MAX_R}")
+    print(f"PLATFORM         : {PLATFORM_BASE_URL}")
+    print(f"SIGNAL EXPIRY    : {SIGNAL_EXPIRY_SECONDS}s")
+    print("SESSION END      : POSITIONS REMAIN OPEN")
+    print("=" * 78)
+    print()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    global primary_candles, session_state, last_session_start, startup_waiting_for_session, current_candle
+
+    print()
+    print("=" * 78)
+    print("🚀 REZA BOT V50.7 DUAL MODE STARTING...")
+    print("=" * 78)
+    print()
+
+    ensure_csv_files()
+    ensure_platform_queue_file()
+
+    print_startup_summary()
+
+    test_platform_connection()
+
+    start_platform_monitor()
+
+    pending_at_startup = read_platform_queue()
+
+    with platform_lock:
+        platform_state["pending_count"] = len(pending_at_startup)
+
+    if pending_at_startup:
+        print()
+        print("=" * 78)
+        print("PENDING PLATFORM SIGNALS")
+        print(f"COUNT            : {len(pending_at_startup)}")
+        print("STATUS           : WILL RETRY AUTOMATICALLY")
+        for pending_signal in pending_at_startup:
+            print(f"  - {pending_signal.get('signal_id')}")
+        print("=" * 78)
+        print()
+
+    print()
+    print("=" * 78)
+    print("LOADING INITIAL CANDLES FROM OKX (STARTUP ONLY)")
+    print("=" * 78)
+
+    primary_candles = load_initial_12_closed_candles()
+
+    print()
+    print("=" * 78)
+    print("OKX DATA LOADED. SWITCHING TO XT FOR LIVE DATA.")
+    print("=" * 78)
+
+    test_connection()
+
+    market = get_market_snapshot()
+    next_session = next_session_start_after(market["ts"])
+
+    session_state = None
+    last_session_start = None
+    startup_waiting_for_session = True
+
+    print()
+    print("=" * 78)
+    print("STARTUP COMPLETE (DUAL MODE)")
+    print(f"CLOSED CANDLES : {len(primary_candles)}")
+    print("STRATEGY        : NOT ACTIVE YET")
+    print(f"WAITING FOR     : {format_utc(next_session)}")
+    print("SESSION ANALYSIS: 12 PREVIOUS CLOSED 5M")
+    print("PLATFORM        : CONNECTED / WAITING")
+    print("EXECUTION       : XT (PLATFORM ONLY)")
+    print("=" * 78)
+    print()
+
+    initialize_current_candle()
+
+    print()
+    print("=" * 78)
+    print("🔥 LIVE REFERENCE MARKET LOOP STARTED (XT PRICES)")
+    print("=" * 78)
+    print("12 CLOSED CANDLES = FROM OKX (STARTUP ONLY)")
+    print("CURRENT 5M = BUILT FROM XT PRICES")
+    print("SESSION = NEXT HH:00 UTC")
+    print("SESSION ANALYSIS = PREVIOUS 12 CLOSED 5M")
+    print("STRATEGY = DUAL MODE")
+    print("  - REVERSE (00-06, 20-23 UTC): LIMIT ENTRY")
+    print("  - TREND (06-20 UTC): MARKET ENTRY")
+    print(f"  - Max R = {MAX_R}")
+    print("SIGNAL = ENABLED")
+    print("MAX SIGNALS / SESSION = 1")
+    print("PLATFORM = ENABLED")
+    print("BOT ORDERS = DISABLED (XT handles execution)")
+    print(f"SIGNAL EXPIRY = {SIGNAL_EXPIRY_SECONDS}s")
+    print("SESSION END = POSITIONS REMAIN OPEN")
+    print("=" * 78)
+    print()
+    print("📊 LIVE STATUS UPDATES EVERY SECOND:")
+    print()
+
+    while running:
+        cycle_start = time.time()
+
+        try:
+            market = get_market_snapshot()
+            process_live_market(market)
+
+            print_live_status()
+
+        except KeyboardInterrupt:
+            raise
+
+        except requests.RequestException as exc:
+            print(f"[NETWORK ERROR] {type(exc).__name__}: {exc}")
+            log.error(f"Network error: {exc}")
+
+        except Exception as exc:
+            print(f"[ERROR] {type(exc).__name__}: {exc}")
+            log.exception("Live loop error")
+
+        elapsed = time.time() - cycle_start
+        remaining = POLL_SECONDS - elapsed
+
+        if remaining > 0:
+            time.sleep(remaining)
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        print("REZA BOT V50.7 DUAL MODE STOPPED BY USER.")
+    except Exception as exc:
+        print()
+        print("=" * 78)
+        print("FATAL ERROR")
+        print("=" * 78)
+        print(f"{type(exc).__name__}: {exc}")
+        print("=" * 78)
